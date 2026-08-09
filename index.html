@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Grain — convert PNG, JPEG, WebP, AVIF and SVG in your browser</title>
+    <meta
+      name="description"
+      content="A free image format converter that runs entirely on your device. Convert and resize PNG, JPEG, WebP, AVIF and SVG in bulk — no uploads, no server, no account."
+    />
+
+    <meta name="theme-color" content="#090b10" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="referrer" content="no-referrer" />
+
+    <!-- Served from public/. Vite rewrites this to a relative path at build time
+         so the site works from a GitHub Pages subpath and from a root domain. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <!-- No CDNs, no webfonts, no third-party scripts: the page must work offline
+         and must not leak a request to anyone while someone converts a photo. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      This converter does all of its work in JavaScript on your own device, so it needs
+      JavaScript enabled to run.
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t">
+  <title id="t">Convertor</title>
+
+  <!--
+    A rounded square converted into a circle: same mass, different form.
+
+    Small-size decisions (the icon is 16 device pixels wide in a tab):
+    - The mark carries its own filled field, so it reads on a light tab strip
+      and a dark one alike, without depending on prefers-color-scheme (which
+      browsers apply inconsistently to favicons).
+    - Flat fills only on the mark. No blurs, no thin strokes, no fine detail.
+    - The two shapes are separated BOTH by a 4-unit knockout gap (1px at 16px)
+      and by a large value/hue jump (white vs amber). The gap alone would smear
+      at 16px; the colour difference is what keeps them separable.
+  -->
+
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+
+    <!-- Bites the circle, plus a 4-unit gap, out of the square. -->
+    <mask id="gap">
+      <rect width="64" height="64" fill="#fff"/>
+      <circle cx="44" cy="44" r="17" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="64" height="64" rx="14" fill="url(#field)"/>
+
+  <!-- Source format. Sized so the bite leaves it still reading as a square. -->
+  <rect x="9" y="9" width="32" height="32" rx="10" fill="#ffffff" mask="url(#gap)"/>
+
+  <!-- Target format. -->
+  <circle cx="44" cy="44" r="13" fill="#fbbf24"/>
+</svg>
