@@ -125,12 +125,33 @@ export interface ConvertFailure {
 
 export type ConvertResult = ConvertSuccess | ConvertFailure
 
+/**
+ * A file the user supplied, together with where it sat in the folder they
+ * dropped.
+ *
+ * `File` cannot carry this on its own: `webkitRelativePath` is populated by the
+ * directory *picker* but is always empty for drag-and-drop, and the property is
+ * read-only so it cannot be back-filled. Pairing the two in one object is the
+ * only way a folder's shape survives the trip from the drop handler to the ZIP.
+ */
+export interface PickedFile {
+  file: File
+  /**
+   * POSIX-style path relative to the dropped root, e.g. `photos/2024/a.png`.
+   * Never absolute, never contains `..`, and is exactly `file.name` for a
+   * loose file that arrived outside any folder.
+   */
+  relativePath: string
+}
+
 /** Lifecycle of one file in the UI. */
 export type JobStatus = 'queued' | 'running' | 'done' | 'error'
 
 export interface Job {
   id: string
   file: File
+  /** See PickedFile.relativePath. Drives the output path inside the ZIP. */
+  relativePath: string
   sourceFormat: SourceFormat
   /** null until probed. */
   sourceWidth: number | null

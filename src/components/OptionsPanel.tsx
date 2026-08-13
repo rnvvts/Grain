@@ -18,6 +18,7 @@ import {
   type ResizeOptions,
 } from '../types'
 import { FormatPicker } from './FormatPicker'
+import { losslessNote } from '../utils/lossless'
 
 const RESIZE_MODES: readonly { mode: ResizeMode; label: string }[] = [
   { mode: 'none', label: 'Original' },
@@ -25,14 +26,6 @@ const RESIZE_MODES: readonly { mode: ResizeMode; label: string }[] = [
   { mode: 'exact', label: 'Exact' },
   { mode: 'scale', label: 'Scale' },
 ]
-
-/** Why quality is inert, worded per-format since "lossless" means something
- * different for a real codec (PNG) than for a wrapper that just carries one
- * (SVG). A generic message would be accurate for one and vague for the other. */
-const LOSSLESS_NOTE: Partial<Record<ImageFormat, string>> = {
-  png: 'PNG is lossless — every pixel is preserved, so quality has no effect on the output.',
-  svg: 'The image is embedded losslessly inside the SVG wrapper, so quality has no effect on the output.',
-}
 
 const RESIZE_HINT: Record<ResizeMode, string> = {
   none: 'Keeps the source pixel dimensions.',
@@ -195,8 +188,7 @@ export function OptionsPanel({ options, onChange, idPrefix }: OptionsPanelProps)
           className="text-xs leading-relaxed text-ink-dim"
         >
           {lossless
-            ? LOSSLESS_NOTE[options.target] ??
-              'This format is lossless, so quality has no effect on the output.'
+            ? losslessNote(options.target)
             : 'Lower means a smaller file and more visible artefacts. 75–85 is a good default.'}
         </p>
       </div>

@@ -1,13 +1,29 @@
 /**
  * Dropzone — the single entry point for files.
  *
- * Three input paths, because one is never enough:
- *   1. drag & drop (desktop, with a real active state)
- *   2. click / Enter / Space to open the native file picker (mobile + a11y)
- *   3. paste from the clipboard (screenshots)
+ * Four input paths, because one is never enough:
+ *   1. drag & drop of loose files (desktop, with a real active state)
+ *   2. drag & drop of whole folders, walked recursively
+ *   3. click / Enter / Space to open the native file picker, plus a second
+ *      picker for choosing a directory (mobile + a11y + no-drag workflows)
+ *   4. paste from the clipboard (screenshots)
+ *
+ * Every path emits `PickedFile`s: the File *and* where it sat in the tree the
+ * user handed over. That pairing is the whole point — `File` cannot carry a
+ * path on its own (`webkitRelativePath` is empty for drag-and-drop and is
+ * read-only), and without it the export could not mirror the upload.
+ *
+ * Paths are built here from the names the filesystem reports, verbatim. No
+ * lowercasing, no slugifying: `Holiday Photos/2024/Beach Day.PNG` stays exactly
+ * that, so the ZIP can hand it back under the same name in the same folder.
  *
  * Non-image files are filtered out but never silently swallowed: they are
- * surfaced inline *and* handed to `onReject` so the page can report them.
+ * summarised in the inline notice below the zone.
+ *
+ * The busy affordance covers the WHOLE ingest, not just the walk: `onFiles`
+ * returns a promise (it sniffs every file's header) and this component waits
+ * for it before going idle. Clearing it when the walk resolved left a
+ * multi-second window where a 1200-file drop looked ignored.
  */
 
 import {
@@ -18,6 +34,8 @@ import {
   type DragEvent as ReactDragEvent,
 } from 'react'
 import { FORMATS, MIME } from '../types'
+import type { PickedFile } from '../types'
+import { createLimiter, type Limiter } from '../utils/limit'
 
 const ACCEPTED_MIME = new Set<string>([
   ...FORMATS.map((f) => MIME[f]),
@@ -38,34 +56,296 @@ function isSupportedImage(file: File): boolean {
   return ACCEPTED_EXT.has(ext)
 }
 
+/* ------------------------------------------------------------------ *
+ * Folder traversal
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deepest nesting we will descend. Real photo libraries are a handful of levels
+ * deep; anything approaching this is a symlink cycle or a hand-built pathology,
+ * and stopping is the graceful answer.
+ */
+const MAX_DEPTH = 50
+
+/**
+ * How many filesystem reads may be in flight at once. A 5000-file tree walked
+ * without a cap opens 5000 simultaneous file handles and stalls the tab; eight
+ * keeps the disk busy without that.
+ */
+const READ_CONCURRENCY = 8
+
+/**
+ * Safety valve for a directory reader that never signals the end. Bounded
+ * generously — a folder of 100k files is absurd, an infinite loop is worse.
+ */
+const MAX_ENTRIES_PER_DIR = 100_000
+
+/** `FileSystemEntry` is a union in practice but not in the type system. */
+function isFileEntry(entry: FileSystemEntry): entry is FileSystemFileEntry {
+  return entry.isFile
+}
+
+function isDirectoryEntry(entry: FileSystemEntry): entry is FileSystemDirectoryEntry {
+  return entry.isDirectory
+}
+
+/**
+ * Read a directory to the end.
+ *
+ * *** The one thing this function exists for. *** `readEntries()` returns AT
+ * MOST 100 entries per call in Chrome, and a short batch is NOT the end of the
+ * directory — only an empty batch is. Calling it once truncates every folder
+ * with more than 100 files in it, which is precisely the case this feature was
+ * built for, and it looks perfectly healthy when tested with ten photos. So the
+ * same reader is drained repeatedly until it yields nothing: a 250-file folder
+ * takes four calls (100, 100, 50, 0).
+ *
+ * A read error resolves with whatever was collected rather than rejecting: one
+ * unreadable subfolder should cost that subfolder, not the entire drop.
+ */
+function readAllEntries(directory: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
+  return new Promise((resolve) => {
+    const reader = directory.createReader()
+    const all: FileSystemEntry[] = []
+
+    const readBatch = (): void => {
+      reader.readEntries(
+        (batch) => {
+          if (batch.length === 0) {
+            resolve(all)
+            return
+          }
+          for (const entry of batch) all.push(entry)
+          if (all.length >= MAX_ENTRIES_PER_DIR) {
+            resolve(all)
+            return
+          }
+          readBatch()
+        },
+        () => resolve(all),
+      )
+    }
+
+    readBatch()
+  })
+}
+
+/**
+ * Promisified `entry.file()`. Resolves null rather than rejecting when the file
+ * has gone (deleted or moved between the drop and the read) so one casualty
+ * cannot hang or abort the walk.
+ */
+function entryToFile(entry: FileSystemFileEntry): Promise<File | null> {
+  return new Promise((resolve) => {
+    entry.file(
+      (file) => resolve(file),
+      () => resolve(null),
+    )
+  })
+}
+
+/**
+ * Depth-first walk of one dropped entry, returning every image-or-not file
+ * under it with the path it had inside the drop.
+ *
+ * Children are started concurrently (throttled by `limit`) but their results
+ * are stitched back together in listing order, so the queue reads folder by
+ * folder rather than in whatever order the disk answered.
+ *
+ * `ancestors` carries the `fullPath` of every directory on the current branch:
+ * a directory that reappears inside itself is a symlink cycle and is skipped.
+ * The depth cap catches the cycles that keep inventing new paths.
+ */
+async function walkEntry(
+  entry: FileSystemEntry,
+  parentPath: string,
+  depth: number,
+  ancestors: readonly string[],
+  limit: Limiter,
+): Promise<PickedFile[]> {
+  const path = parentPath.length > 0 ? `${parentPath}/${entry.name}` : entry.name
+
+  if (isFileEntry(entry)) {
+    const file = await limit(() => entryToFile(entry))
+    return file ? [{ file, relativePath: path }] : []
+  }
+
+  if (!isDirectoryEntry(entry) || depth >= MAX_DEPTH) return []
+
+  const fullPath = entry.fullPath
+  if (fullPath.length > 0 && ancestors.includes(fullPath)) return []
+  const branch = fullPath.length > 0 ? [...ancestors, fullPath] : ancestors
+
+  const children = await limit(() => readAllEntries(entry))
+  const nested = await Promise.all(
+    children.map((child) => walkEntry(child, path, depth + 1, branch, limit)),
+  )
+  return nested.flat()
+}
+
+/** Walk every dropped entry, root files first-come, in the order they arrived. */
+async function walkEntries(entries: readonly FileSystemEntry[]): Promise<PickedFile[]> {
+  const limit = createLimiter(READ_CONCURRENCY)
+  const trees = await Promise.all(entries.map((entry) => walkEntry(entry, '', 0, [], limit)))
+  return trees.flat()
+}
+
+interface DroppedEntries {
+  entries: FileSystemEntry[]
+  /** True when at least one dropped item is a directory. */
+  sawDirectory: boolean
+  /** False when this browser has no FileSystem entry API to offer. */
+  supported: boolean
+}
+
+/**
+ * MUST be called synchronously inside the drop handler: a DataTransfer's item
+ * list is neutered the instant the handler yields, so a single `await` before
+ * this runs turns a 500-file folder into an empty drop.
+ */
+function collectDroppedEntries(items: DataTransferItemList | undefined): DroppedEntries {
+  const entries: FileSystemEntry[] = []
+  let sawDirectory = false
+
+  if (!items) return { entries, sawDirectory, supported: false }
+
+  for (const item of Array.from(items)) {
+    if (item.kind !== 'file') continue
+    if (typeof item.webkitGetAsEntry !== 'function') {
+      return { entries: [], sawDirectory: false, supported: false }
+    }
+    const entry = item.webkitGetAsEntry()
+    if (!entry) continue
+    if (entry.isDirectory) sawDirectory = true
+    entries.push(entry)
+  }
+
+  return { entries, sawDirectory, supported: true }
+}
+
+/* ------------------------------------------------------------------ *
+ * Plain file lists
+ * ------------------------------------------------------------------ */
+
+/**
+ * Pair loose Files with a path.
+ *
+ * `webkitRelativePath` is populated by the directory picker (`MyFolder/sub/a.png`)
+ * and empty everywhere else, where the bare filename is the correct path: the
+ * file sits at the root of the archive.
+ */
+function toPickedFiles(files: ArrayLike<File> | null | undefined): PickedFile[] {
+  return Array.from(files ?? []).map((file) => ({
+    file,
+    relativePath: file.webkitRelativePath || file.name,
+  }))
+}
+
+/* ------------------------------------------------------------------ *
+ * Component
+ * ------------------------------------------------------------------ */
+
+/** How many rejected names are worth spelling out before they become noise. */
+const NAMES_SHOWN = 4
+
+interface RejectionNotice {
+  /** Total files skipped. 0 means a folder held no images at all. */
+  count: number
+  /** The first few names, for the loose-file case where naming them helps. */
+  names: string[]
+  /** Files came from a folder, where stray .txt/.DS_Store files are normal. */
+  fromFolder: boolean
+}
+
 export interface DropzoneProps {
-  /** Called with every supported image the user supplied. Never called empty. */
-  onFiles: (files: File[]) => void
-  /** Called with the files that were filtered out, so nothing disappears quietly. */
-  onReject?: (files: File[]) => void
+  /**
+   * Called with every supported image the user supplied, each carrying the path
+   * it had inside the dropped folder. Never called empty.
+   *
+   * May return a promise; the zone stays visibly busy until it settles, so the
+   * header-sniffing phase is covered by the same affordance as the walk.
+   */
+  onFiles: (files: PickedFile[]) => void | Promise<void>
   disabled?: boolean
 }
 
-export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps) {
+/** What the zone is doing, when it is doing anything. */
+type Phase = 'scanning' | 'adding'
+
+const PHASE_LABEL: Record<Phase, string> = {
+  scanning: 'Reading folder…',
+  adding: 'Adding images…',
+}
+
+export function Dropzone({ onFiles, disabled = false }: DropzoneProps) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
   const dragDepth = useRef(0)
   const [dragging, setDragging] = useState(false)
-  const [rejected, setRejected] = useState<string[]>([])
+  const [phase, setPhase] = useState<Phase | null>(null)
+  /** Last completed outcome, for the live region only. */
+  const [announcement, setAnnouncement] = useState('')
+  const [rejected, setRejected] = useState<RejectionNotice | null>(null)
+
+  /**
+   * `webkitdirectory` cannot be written as a JSX prop (React forwards unknown
+   * props but TypeScript rejects it, and the DOM property is the documented
+   * way), so it is set on the element itself. It lives on its *own* input:
+   * putting it on the multi-file input would turn that picker into a
+   * folders-only picker and make loose files unselectable.
+   */
+  useEffect(() => {
+    const el = folderInputRef.current
+    if (el) el.webkitdirectory = true
+  }, [])
 
   const ingest = useCallback(
-    (files: File[]) => {
-      if (disabled || files.length === 0) return
-      const accepted: File[] = []
-      const skipped: File[] = []
-      for (const file of files) {
-        if (isSupportedImage(file)) accepted.push(file)
-        else skipped.push(file)
+    async (picked: PickedFile[], fromFolder: boolean): Promise<void> => {
+      if (disabled) return
+      setAnnouncement('')
+
+      if (picked.length === 0) {
+        // A folder that held nothing we can convert is a real outcome the user
+        // needs told about — and it arrives here from BOTH entry points, the
+        // walk and the `webkitdirectory` picker, which used to bail silently.
+        // An empty loose-file pick is just a cancelled dialog, and deserves
+        // silence.
+        if (fromFolder) setRejected({ count: 0, names: [], fromFolder: true })
+        return
       }
-      setRejected(skipped.map((f) => f.name || 'unnamed file'))
-      if (skipped.length > 0) onReject?.(skipped)
-      if (accepted.length > 0) onFiles(accepted)
+
+      const accepted: PickedFile[] = []
+      const skipped: File[] = []
+      for (const item of picked) {
+        if (isSupportedImage(item.file)) accepted.push(item)
+        else skipped.push(item.file)
+      }
+
+      setRejected(
+        skipped.length > 0
+          ? {
+              count: skipped.length,
+              names: skipped.slice(0, NAMES_SHOWN).map((f) => f.name || 'unnamed file'),
+              fromFolder,
+            }
+          : null,
+      )
+      if (accepted.length === 0) return
+
+      // Stay busy for the whole ingest, not just up to this call: `onFiles`
+      // reads a header off every accepted file, which for a folder of a few
+      // thousand images is the longest part of the drop.
+      setPhase('adding')
+      try {
+        await onFiles(accepted)
+        setAnnouncement(
+          `Added ${accepted.length} ${accepted.length === 1 ? 'image' : 'images'}`,
+        )
+      } finally {
+        setPhase(null)
+      }
     },
-    [disabled, onFiles, onReject],
+    [disabled, onFiles],
   )
 
   // Keep a stable ref to the latest ingest so the document listener below is
@@ -92,7 +372,8 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
       if (files.length === 0) return
 
       if (files.some(isSupportedImage)) event.preventDefault()
-      ingestRef.current(files)
+      // A pasted screenshot has no folder of its own: its name is its path.
+      void ingestRef.current(toPickedFiles(files), false)
     }
 
     document.addEventListener('paste', onPaste)
@@ -104,12 +385,56 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
     inputRef.current?.click()
   }
 
+  const openFolderPicker = () => {
+    if (disabled) return
+    folderInputRef.current?.click()
+  }
+
   const hasFiles = (event: ReactDragEvent<HTMLButtonElement>) =>
     Array.from(event.dataTransfer.types).includes('Files')
 
+  const handleDrop = (event: ReactDragEvent<HTMLButtonElement>) => {
+    if (disabled) return
+    event.preventDefault()
+    dragDepth.current = 0
+    setDragging(false)
+
+    // Read the DataTransfer NOW. Both of these are dead the moment this handler
+    // yields, so nothing above them may await.
+    const loose = toPickedFiles(event.dataTransfer.files)
+    const { entries, sawDirectory, supported } = collectDroppedEntries(event.dataTransfer.items)
+
+    // No folders involved (or a browser without the entry API): the flat file
+    // list is complete and correct, and walking would only add latency.
+    if (!supported || entries.length === 0 || !sawDirectory) {
+      void ingest(loose, false)
+      return
+    }
+
+    setPhase('scanning')
+    void (async () => {
+      try {
+        const picked = await walkEntries(entries)
+        // An empty walk falls through to `ingest`, which reports "no images in
+        // that folder". `loose` is useless in that case: a dropped folder
+        // appears in `dataTransfer.files` as a directory masquerading as a
+        // file, and queueing it would report the folder as an unsupported file.
+        await ingest(picked, true)
+      } catch {
+        // The walk failed outright (permissions, a revoked drop). Anything the
+        // browser already flattened is better than losing the drop entirely.
+        await ingest(loose, true)
+      } finally {
+        // `ingest` owns the 'adding' phase and clears it; this is the backstop
+        // for the walk itself and for a throw before ingest ever ran.
+        setPhase(null)
+      }
+    })()
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      {/* Sibling, not a child: a click() on a nested input would bubble back
+      {/* Siblings, not children: a click() on a nested input would bubble back
           into the button and re-open the picker forever. */}
       <input
         ref={inputRef}
@@ -120,8 +445,26 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
         aria-hidden="true"
         className="sr-only absolute h-0 w-0 opacity-0"
         onChange={(event) => {
-          ingest(Array.from(event.target.files ?? []))
+          void ingest(toPickedFiles(event.target.files), false)
           // Allow re-picking the exact same file.
+          event.target.value = ''
+        }}
+      />
+
+      {/* Deliberately no `accept`: a directory pick hands over everything inside
+          it, and filtering here (rather than in the dialog) is what lets the
+          notice below say how many non-images were passed over. */}
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        tabIndex={-1}
+        aria-hidden="true"
+        className="sr-only absolute h-0 w-0 opacity-0"
+        onChange={(event) => {
+          // Deliberately called even when the FileList is empty: picking a
+          // folder with nothing in it must say so, not do nothing.
+          void ingest(toPickedFiles(event.target.files), true)
           event.target.value = ''
         }}
       />
@@ -130,7 +473,14 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
         type="button"
         onClick={openPicker}
         disabled={disabled}
-        aria-label="Add images — drop them here, click to browse, or paste from the clipboard"
+        aria-busy={phase !== null}
+        /*
+          Deliberately NO aria-label. One would override the button's own text,
+          hiding the three states it cycles through ("Release to add them" /
+          "Reading folder…" / "Drop images or folders here") from every screen
+          reader — the states are the whole point of the copy. The visible text
+          is the accessible name; the live region below announces changes.
+        */
         onDragEnter={(event) => {
           if (disabled || !hasFiles(event)) return
           event.preventDefault()
@@ -148,13 +498,7 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
           dragDepth.current = Math.max(0, dragDepth.current - 1)
           if (dragDepth.current === 0) setDragging(false)
         }}
-        onDrop={(event) => {
-          if (disabled) return
-          event.preventDefault()
-          dragDepth.current = 0
-          setDragging(false)
-          ingest(Array.from(event.dataTransfer.files))
-        }}
+        onDrop={handleDrop}
         className={[
           'group relative flex w-full flex-col items-center justify-center gap-4 rounded-xl border border-dashed px-6 py-14 text-center transition-colors duration-150',
           'focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent',
@@ -191,7 +535,11 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
 
         <span className="flex flex-col gap-1.5">
           <span className="text-base font-medium text-ink">
-            {dragging ? 'Release to add images' : 'Drop images here'}
+            {dragging
+              ? 'Release to add them'
+              : phase !== null
+                ? PHASE_LABEL[phase]
+                : 'Drop images or folders here'}
           </span>
           <span className="text-sm text-ink-dim">
             or <span className="text-accent underline underline-offset-4">browse</span>{' '}
@@ -207,7 +555,26 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
         </span>
       </button>
 
-      {rejected.length > 0 ? (
+      {/* The button's own text changes silently for assistive tech (its
+          accessible name is only recomputed on focus), so the progress of a
+          long folder ingest is announced from here instead. */}
+      <p role="status" aria-live="polite" className="sr-only">
+        {phase !== null ? PHASE_LABEL[phase] : announcement}
+      </p>
+
+      <p className="flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-center text-xs text-ink-dim">
+        <button
+          type="button"
+          onClick={openFolderPicker}
+          disabled={disabled}
+          className="rounded px-1 py-0.5 font-medium text-accent underline underline-offset-4 transition-colors hover:text-accent-hi disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        >
+          Select a folder
+        </button>
+        <span>subfolders included — the export keeps your names and folders</span>
+      </p>
+
+      {rejected !== null ? (
         <div
           role="status"
           className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-left"
@@ -226,17 +593,39 @@ export function Dropzone({ onFiles, onReject, disabled = false }: DropzoneProps)
             <circle cx="12" cy="12" r="9" />
           </svg>
           <p className="min-w-0 flex-1 text-sm text-amber-200">
-            <span className="font-medium">
-              Skipped {rejected.length} {rejected.length === 1 ? 'file' : 'files'}
-            </span>{' '}
-            <span className="text-amber-200/70">
-              — not a supported image: {rejected.slice(0, 4).join(', ')}
-              {rejected.length > 4 ? ` and ${rejected.length - 4} more` : ''}
-            </span>
+            {rejected.count === 0 ? (
+              <>
+                <span className="font-medium">No images in that folder</span>{' '}
+                <span className="text-amber-200/70">— nothing to convert</span>
+              </>
+            ) : rejected.fromFolder ? (
+              /* Stray .DS_Store / .txt / video files are ordinary in a photo
+                 folder — summarise them instead of reciting 200 names. */
+              <>
+                <span className="font-medium">
+                  Skipped {rejected.count} non-image {rejected.count === 1 ? 'file' : 'files'}
+                </span>{' '}
+                <span className="text-amber-200/70">
+                  — only PNG, JPEG, WebP, AVIF and SVG are converted
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="font-medium">
+                  Skipped {rejected.count} {rejected.count === 1 ? 'file' : 'files'}
+                </span>{' '}
+                <span className="text-amber-200/70">
+                  — not a supported image: {rejected.names.join(', ')}
+                  {rejected.count > rejected.names.length
+                    ? ` and ${rejected.count - rejected.names.length} more`
+                    : ''}
+                </span>
+              </>
+            )}
           </p>
           <button
             type="button"
-            onClick={() => setRejected([])}
+            onClick={() => setRejected(null)}
             className="shrink-0 rounded-lg px-2 py-0.5 text-xs font-medium text-amber-200/80 transition-colors hover:bg-amber-500/15 hover:text-amber-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-300"
           >
             Dismiss

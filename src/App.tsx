@@ -1,11 +1,9 @@
-import { useMemo } from 'react'
 import { Dropzone } from './components/Dropzone'
 import { FileCard } from './components/FileCard'
 import { OptionsPanel } from './components/OptionsPanel'
 import { Stat } from './components/Stat'
-import { mergeOptions, useConverter } from './state/useConverter'
+import { useConverter, type Notice, type NoticeTone } from './state/useConverter'
 import { formatBytes, formatPercent, formatSignedBytes } from './utils/format'
-import type { ConvertOptions } from './types'
 
 /* ---- shared class strings ------------------------------------------ */
 
@@ -17,6 +15,72 @@ const PRIMARY = `${BUTTON_BASE} bg-accent text-accent-ink hover:bg-accent-hi`
 const SECONDARY = `${BUTTON_BASE} border border-hairline bg-surface-2 text-ink hover:border-ink-dim`
 const QUIET = `${BUTTON_BASE} text-ink-dim hover:text-ink`
 
+/* ---- skipped-file report -------------------------------------------- */
+
+/** How many skipped files are worth naming before the list becomes noise. */
+const NOTICES_SHOWN = 6
+
+const NOTICE_STYLE: Record<NoticeTone, { box: string; title: string; body: string; dismiss: string }> = {
+  warn: {
+    box: 'border-amber-500/30 bg-amber-500/10',
+    title: 'text-amber-200',
+    body: 'text-amber-100/70',
+    dismiss: 'text-amber-200/80 hover:text-amber-100',
+  },
+  // Re-adding files you already queued is an ordinary, harmless thing to do.
+  // Reported in the page's neutral surface colours, not the warning amber.
+  info: {
+    box: 'border-hairline bg-surface',
+    title: 'text-ink',
+    body: 'text-ink-dim',
+    dismiss: 'text-ink-dim hover:text-ink',
+  },
+}
+
+function NoticeBlock({
+  tone,
+  title,
+  notices,
+  onDismiss,
+}: {
+  tone: NoticeTone
+  title: string
+  notices: Notice[]
+  onDismiss: (tone: NoticeTone) => void
+}) {
+  const style = NOTICE_STYLE[tone]
+  // Every neutral notice shares one reason, and the heading already says it —
+  // repeating it on all six rows is noise.
+  const showReason = new Set(notices.map((notice) => notice.reason)).size > 1
+  return (
+    <div className={`mt-4 rounded-lg border px-4 py-3 text-sm ${style.box}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className={`font-medium ${style.title}`}>{title}</p>
+          <ul className={`mt-1.5 space-y-0.5 ${style.body}`}>
+            {notices.slice(0, NOTICES_SHOWN).map((notice, index) => (
+              <li key={`${notice.name}-${index}`} className="truncate">
+                <span className="font-medium">{notice.name}</span>
+                {showReason ? ` — ${notice.reason}` : ''}
+              </li>
+            ))}
+            {notices.length > NOTICES_SHOWN && (
+              <li>and {notices.length - NOTICES_SHOWN} more</li>
+            )}
+          </ul>
+        </div>
+        <button
+          type="button"
+          onClick={() => onDismiss(tone)}
+          className={`shrink-0 rounded px-2 py-1 text-xs ${style.dismiss}`}
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+  )
+}
+
 /* ---- page ----------------------------------------------------------- */
 
 export default function App() {
@@ -27,6 +91,7 @@ export default function App() {
     isConverting,
     isZipping,
     notices,
+    rootFolder,
     addFiles,
     updateOptions,
     setOverride,
@@ -39,13 +104,19 @@ export default function App() {
     dismissNotices,
   } = useConverter()
 
-  // Resolve each job's effective settings once per render rather than inside
-  // every card, so the list stays cheap with a few hundred rows.
-  const effective = useMemo(() => {
-    const map = new Map<string, ConvertOptions>()
-    for (const job of jobs) map.set(job.id, mergeOptions(options, job.overrides))
-    return map
-  }, [jobs, options])
+  /*
+   * Each card merges the global options with its own overrides internally, and
+   * is memoised on them. Doing it here instead — one Map of N merged option
+   * objects per render — cost O(N) on every one of the thousands of commits a
+   * folder ingest produces, and handed each card a fresh object that defeated
+   * memoisation anyway.
+   *
+   * `rootFolder` comes from the hook for the same reason: it is only
+   * recomputed when the list's membership changes.
+   */
+
+  const warnings = notices.filter((notice) => notice.tone === 'warn')
+  const duplicates = notices.filter((notice) => notice.tone === 'info')
 
   const settled = summary.done + summary.error
   const progress = summary.total > 0 ? (settled / summary.total) * 100 : 0
@@ -63,6 +134,12 @@ export default function App() {
           <p className="mt-3 max-w-2xl text-base text-ink-dim sm:text-lg">
             Convert between PNG, JPEG, WebP, AVIF and SVG — resize, re-quantise and batch a
             whole folder at once.
+          </p>
+
+          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-ink-dim">
+            Folders are handled whole: drop one and every image inside it is converted, however
+            deep the nesting. The ZIP comes back with the same folders and the same filenames you
+            dropped in — only the extension changes, to match the format you picked.
           </p>
 
           <p className="mt-5 flex max-w-2xl items-start gap-2.5 rounded-lg border border-hairline bg-surface px-3.5 py-3 text-sm leading-relaxed">
@@ -86,31 +163,22 @@ export default function App() {
         {/* ---------------- dropzone ---------------- */}
         <Dropzone onFiles={addFiles} disabled={isConverting} />
 
-        {notices.length > 0 && (
-          <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="font-medium text-amber-200">
-                  {notices.length} {notices.length === 1 ? 'file was' : 'files were'} skipped
-                </p>
-                <ul className="mt-1.5 space-y-0.5 text-amber-100/70">
-                  {notices.slice(0, 6).map((notice, index) => (
-                    <li key={`${notice.name}-${index}`} className="truncate">
-                      <span className="font-medium">{notice.name}</span> — {notice.reason}
-                    </li>
-                  ))}
-                  {notices.length > 6 && <li>and {notices.length - 6} more</li>}
-                </ul>
-              </div>
-              <button
-                type="button"
-                onClick={dismissNotices}
-                className="shrink-0 rounded px-2 py-1 text-xs text-amber-200/80 hover:text-amber-100"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
+        {warnings.length > 0 && (
+          <NoticeBlock
+            tone="warn"
+            title={`${warnings.length} ${warnings.length === 1 ? 'file was' : 'files were'} skipped`}
+            notices={warnings}
+            onDismiss={dismissNotices}
+          />
+        )}
+
+        {duplicates.length > 0 && (
+          <NoticeBlock
+            tone="info"
+            title={`${duplicates.length} ${duplicates.length === 1 ? 'file was' : 'files were'} already in the list`}
+            notices={duplicates}
+            onDismiss={dismissNotices}
+          />
         )}
 
         {/* ---------------- body ---------------- */}
@@ -120,6 +188,32 @@ export default function App() {
           </aside>
 
           <section className="min-w-0">
+            {rootFolder.length > 0 && (
+              <p className="mb-3 flex items-center gap-2 text-xs text-ink-dim">
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="size-3.5 shrink-0"
+                >
+                  <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h7A1.5 1.5 0 0 1 19 10v7a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 3 17V7.5Z" />
+                </svg>
+                <span className="truncate text-ink" title={`${rootFolder}/`}>
+                  {rootFolder}/
+                </span>
+                <span aria-hidden="true" className="shrink-0 text-hairline">
+                  ·
+                </span>
+                <span className="num shrink-0">
+                  {summary.total} {summary.total === 1 ? 'file' : 'files'}
+                </span>
+              </p>
+            )}
+
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <Stat
                 label="Files"
@@ -171,7 +265,7 @@ export default function App() {
                     <li key={job.id} className="min-w-0">
                       <FileCard
                         job={job}
-                        effectiveOptions={effective.get(job.id) ?? options}
+                        options={options}
                         onRemove={removeJob}
                         onOverride={setOverride}
                         onDownload={downloadOne}

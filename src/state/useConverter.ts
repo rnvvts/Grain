@@ -5,12 +5,17 @@
  * with the File API, handed to a worker pool as transferable ArrayBuffers, and
  * handed back as bytes we wrap in object URLs. Nothing is ever uploaded.
  *
- * Two invariants worth protecting when editing this file:
+ * Three invariants worth protecting when editing this file:
  *   1. Exactly ONE ConverterPool per mounted hook. It lives in a ref and is
  *      terminated on unmount. A pool per render leaks a worker per render.
  *   2. Every URL.createObjectURL call registers its URL in `urlsRef` so the
  *      unmount/remove paths can revoke it. A hundred un-revoked photo previews
  *      pins hundreds of megabytes for the lifetime of the tab.
+ *   3. A file's identity is its `relativePath`, never its bare `file.name`.
+ *      `a/logo.png` and `b/logo.png` are two different files; the ZIP has to
+ *      contain both, in their own folders, under their original names. Every
+ *      name here therefore travels as a path and is only ever split with the
+ *      helpers in `utils/path`, which preserve names verbatim.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -19,13 +24,21 @@ import { ConverterPool } from '../workers/pool'
 import { sniffFormat } from '../engine/format'
 import { UNDECODABLE_SVG_MESSAGE } from '../engine/decode'
 import { DEFAULT_OPTIONS, EXTENSION, MIME } from '../types'
+import {
+  commonRootFolder,
+  sanitizeRelativePath,
+  splitPath,
+  uniquePath,
+  withBase,
+} from '../utils/path'
+import { createLimiter } from '../utils/limit'
 import type {
   ConvertOptions,
   ConvertRequest,
   ConvertResult,
   ConvertSuccess,
-  ImageFormat,
   Job,
+  PickedFile,
   SourceFormat,
 } from '../types'
 
@@ -33,10 +46,21 @@ import type {
  * Public shape
  * ------------------------------------------------------------------ */
 
+/**
+ * How loudly a notice should read.
+ *
+ * Re-dropping a folder you already added is ordinary and harmless, so the
+ * files it skips are reported neutrally. A file we could not read at all is a
+ * genuine warning. Rendering both in the same amber box made an everyday
+ * action look like an error.
+ */
+export type NoticeTone = 'warn' | 'info'
+
 /** A file we refused to queue, plus the reason, surfaced to the user. */
 export interface Notice {
   name: string
   reason: string
+  tone: NoticeTone
 }
 
 export interface ConverterSummary {
@@ -66,7 +90,23 @@ export interface ConverterApi {
   isConverting: boolean
   isZipping: boolean
   notices: Notice[]
-  addFiles: (files: File[]) => void
+  /**
+   * The folder every queued file came from, or '' when they came from
+   * different roots or arrived loose.
+   *
+   * Derived here rather than in the view because it is O(n) in paths and must
+   * NOT be recomputed on every commit: a batch of 5000 files produces
+   * thousands of status updates, and re-splitting 5000 paths on each of them
+   * is most of a quadratic freeze. It only changes when the list's membership
+   * does, which is exactly when the cache below is invalidated.
+   */
+  rootFolder: string
+  /**
+   * Takes files *with their folder paths*, so the export can mirror the upload.
+   * Resolves once every file has been sniffed and committed, so the caller can
+   * keep a busy affordance up for the whole ingest.
+   */
+  addFiles: (picked: PickedFile[]) => Promise<void>
   updateOptions: (patch: Partial<ConvertOptions>) => void
   setOverride: (id: string, patch: Partial<ConvertOptions> | null) => void
   convertAll: () => void
@@ -75,7 +115,8 @@ export interface ConverterApi {
   downloadAllZip: () => void
   removeJob: (id: string) => void
   clearAll: () => void
-  dismissNotices: () => void
+  /** Clears one tone's notices, or all of them when called with no argument. */
+  dismissNotices: (tone?: NoticeTone) => void
 }
 
 /* ------------------------------------------------------------------ *
@@ -251,39 +292,65 @@ function probeDimensions(url: string): Promise<{ width: number; height: number }
 
 /* ---- naming -------------------------------------------------------- */
 
-function sanitizeName(name: string): string {
-  const cleaned = name.replace(/[\\/:*?"<>|]+/g, '_').trim()
-  return cleaned.length > 0 ? cleaned : 'image'
-}
+/**
+ * Naming rule for the whole file: the output keeps the user's own filename,
+ * verbatim, and only its extension changes. Nothing here lowercases, trims,
+ * slugifies or substitutes characters — see `utils/path` for why.
+ */
 
-/** Only appends when the engine handed back a bare stem; never doubles up. */
-function ensureExtension(name: string, format: ImageFormat): string {
-  const dot = name.lastIndexOf('.')
-  const hasPlausibleExtension = dot > 0 && name.length - dot <= 6
-  return hasPlausibleExtension ? name : `${name}.${EXTENSION[format]}`
+/** Extensions short and alphanumeric enough to be a real file extension. */
+const EXTENSION_PATTERN = /^[A-Za-z0-9]{1,8}$/
+
+/**
+ * The output *filename* for a finished job, with no directory part: the user's
+ * own filename with its extension swapped, and nothing else touched.
+ *
+ * The stem is read from the job's `relativePath`, NOT from `success.outName`.
+ * The engine's `outputName` normalises what it is handed — it trims surrounding
+ * whitespace and strips trailing dots from the stem — which is harmless when
+ * naming a single download but breaks the promise this feature exists to keep:
+ * a file the user has on disk as ` leading.png` has to come back as
+ * ` leading.webp`, not `leading.webp`. `outName` cannot carry the folder
+ * either, which is why the directory was already taken from `relativePath`
+ * (see `outputPathOf`); taking the stem from the same place leaves exactly one
+ * source of truth for a file's name.
+ */
+export function outputBaseOf(job: Job, success: ConvertSuccess): string {
+  const base = splitPath(job.relativePath).base
+  const dot = base.lastIndexOf('.')
+  // `dot > 0` keeps a dotfile like `.gitignore` whole; the pattern keeps a name
+  // like `photo.jpeg copy` whole rather than amputating the ` copy` that is the
+  // only thing telling it apart from `photo.jpeg`.
+  const hasExtension = dot > 0 && EXTENSION_PATTERN.test(base.slice(dot + 1))
+  const stem = hasExtension ? base.slice(0, dot) : base
+  return `${stem}.${EXTENSION[success.outFormat]}`
 }
 
 /**
- * a.png and a.jpg both targeting webp both want "a.webp". The second one
- * becomes "a-1.webp" so the archive keeps every file instead of silently
- * overwriting entries.
+ * Where a finished job belongs inside the archive: its original folder, its
+ * original filename, and the new extension. This is the whole promise of the
+ * feature in one line — `photos/2024/Beach Day.PNG` comes back as
+ * `photos/2024/Beach Day.webp`, same folder, same spelling.
+ *
+ * Exported because it is also the only correct thing to *say* about a finished
+ * job. `success.outName` is the engine's normalised name and disagrees with
+ * what actually gets written (it trims a leading space, strips a trailing
+ * dot), so it must never reach a label the user can read.
  */
-function uniqueName(name: string, used: Set<string>): string {
-  if (!used.has(name)) {
-    used.add(name)
-    return name
-  }
-  const dot = name.lastIndexOf('.')
-  const stem = dot > 0 ? name.slice(0, dot) : name
-  const ext = dot > 0 ? name.slice(dot) : ''
-  let n = 1
-  let candidate = `${stem}-${n}${ext}`
-  while (used.has(candidate)) {
-    n += 1
-    candidate = `${stem}-${n}${ext}`
-  }
-  used.add(candidate)
-  return candidate
+export function outputPathOf(job: Job, success: ConvertSuccess): string {
+  return withBase(job.relativePath, outputBaseOf(job, success))
+}
+
+/**
+ * The duplicate key for ingest. Keyed on the *path*, because a folder tree is
+ * full of files that share a name: `icons/light/logo.png` and
+ * `icons/dark/logo.png` are two different images, and keying on `file.name`
+ * would throw the second one away as a duplicate. Size and mtime stay in the
+ * key so re-dropping a folder after editing a file inside it brings in the new
+ * version rather than being rejected as already present.
+ */
+function dedupeKey(relativePath: string, file: File): string {
+  return `${relativePath}|${file.size}|${file.lastModified}`
 }
 
 /* ---- browser plumbing ---------------------------------------------- */
@@ -338,12 +405,43 @@ function successOf(job: Job): ConvertSuccess | null {
  * Hook
  * ------------------------------------------------------------------ */
 
+/**
+ * How many files are sniffed in parallel before the batch is committed.
+ *
+ * Small enough that the first cards appear within ~100 ms of a drop, large
+ * enough that a few thousand files cost a few dozen commits instead of a few
+ * thousand. Sniffing serially and committing once at the end left a 1.75 s
+ * window (measured, 1200 files) with no cards and no spinner.
+ */
+const INGEST_BATCH = 32
+
+/** Simultaneous `Image` decodes for the dimension probe. */
+const PROBE_CONCURRENCY = 8
+
+/**
+ * How long probe results accumulate before one commit drains them.
+ *
+ * Each probe resolves on its own `img.onload` macrotask, so React cannot batch
+ * them: committing per file is one O(n) re-render per file — quadratic, and
+ * measured at ~86 s of pure state work for 5000 files. Buffering turns the
+ * whole batch into a handful of commits.
+ */
+const PROBE_FLUSH_MS = 100
+
 export function useConverter(): ConverterApi {
   const [jobs, setJobs] = useState<Job[]>([])
   const [options, setOptions] = useState<ConvertOptions>(DEFAULT_OPTIONS)
   const [notices, setNotices] = useState<Notice[]>([])
   const [isConverting, setIsConverting] = useState(false)
   const [isZipping, setIsZipping] = useState(false)
+
+  /**
+   * jobId -> relativePath, replaced only when the list's *membership* changes.
+   * `relativePath` is immutable for the life of a job, so this map is a stable
+   * dependency for the (expensive) root-folder derivation, where `jobs` — whose
+   * identity changes on every status tick — is not.
+   */
+  const [pathIndex, setPathIndex] = useState<ReadonlyMap<string, string>>(new Map())
 
   /** Post-commit mirror of `jobs`, so async loops can read the live list. */
   const jobsRef = useRef<Job[]>([])
@@ -360,6 +458,12 @@ export function useConverter(): ConverterApi {
   /** Bumped to invalidate an in-flight batch (cancel, clear, unmount). */
   const runTokenRef = useRef(0)
   const runningRef = useRef(false)
+
+  /** Caps how many `Image` decoders exist at once during a folder ingest. */
+  const probeLimitRef = useRef(createLimiter(PROBE_CONCURRENCY))
+  /** Probe results waiting for the next flush. */
+  const probeBufferRef = useRef<Map<string, { width: number; height: number }>>(new Map())
+  const probeTimerRef = useRef<number | null>(null)
 
   const createUrl = useCallback((blob: Blob): string => {
     const url = URL.createObjectURL(blob)
@@ -398,6 +502,11 @@ export function useConverter(): ConverterApi {
     return () => {
       runTokenRef.current += 1
       runningRef.current = false
+      if (probeTimerRef.current !== null) {
+        window.clearTimeout(probeTimerRef.current)
+        probeTimerRef.current = null
+      }
+      probeBufferRef.current.clear()
       if (poolRef.current) {
         poolRef.current.terminate()
         poolRef.current = null
@@ -413,39 +522,104 @@ export function useConverter(): ConverterApi {
 
   /* ---- ingest ------------------------------------------------------ */
 
+  /** Drain the probe buffer into exactly one commit. */
+  const flushProbes = useCallback((): void => {
+    probeTimerRef.current = null
+    const sizes = probeBufferRef.current
+    if (sizes.size === 0) return
+    probeBufferRef.current = new Map()
+
+    setJobs((prev) => {
+      let touched = false
+      const next = prev.map((job) => {
+        const size = sizes.get(job.id)
+        if (!size) return job
+        touched = true
+        return { ...job, sourceWidth: size.width, sourceHeight: size.height }
+      })
+      return touched ? next : prev
+    })
+  }, [])
+
+  /**
+   * Measure each new job's intrinsic size, at most PROBE_CONCURRENCY decoders
+   * at a time, and fold the answers into a single periodic commit.
+   */
+  const probeAll = useCallback(
+    (newJobs: readonly Job[]): void => {
+      const limit = probeLimitRef.current
+      for (const job of newJobs) {
+        void limit(async () => {
+          const size = await probeDimensions(job.previewUrl)
+          if (!size) return
+          probeBufferRef.current.set(job.id, size)
+          if (probeTimerRef.current === null) {
+            probeTimerRef.current = window.setTimeout(flushProbes, PROBE_FLUSH_MS)
+          }
+        })
+      }
+    },
+    [flushProbes],
+  )
+
   const addFiles = useCallback(
-    (files: File[]): void => {
-      if (files.length === 0) return
+    async (picked: PickedFile[]): Promise<void> => {
+      if (picked.length === 0) return
 
-      void (async () => {
-        const seen = new Set(
-          jobsRef.current.map((j) => `${j.file.name}|${j.file.size}|${j.file.lastModified}`),
-        )
-        const accepted: Job[] = []
-        const rejected: Notice[] = []
+      // A new drop supersedes the last one's report. Without this, a warning
+      // from an unrelated earlier drop sits on the page next to the Dropzone's
+      // own fresh banner, showing two different counts for two different events.
+      setNotices([])
 
-        for (const file of files) {
-          const key = `${file.name}|${file.size}|${file.lastModified}`
-          if (seen.has(key)) {
-            rejected.push({ name: file.name, reason: 'already in the list' })
-            continue
-          }
-          seen.add(key)
+      const seen = new Set(jobsRef.current.map((j) => dedupeKey(j.relativePath, j.file)))
+      const rejected: Notice[] = []
+      /** Survived the cheap checks; still needs its header read. */
+      const candidates: { file: File; path: string }[] = []
 
-          if (file.size === 0) {
-            rejected.push({ name: file.name, reason: 'empty file' })
-            continue
-          }
+      for (const { file, relativePath } of picked) {
+        // A loose file dropped outside any folder has no path of its own; its
+        // name *is* its path, at the root of the archive.
+        const path = sanitizeRelativePath(relativePath || file.name)
 
-          const sourceFormat = await detectFormat(file)
+        const key = dedupeKey(path, file)
+        if (seen.has(key)) {
+          rejected.push({ name: path, reason: 'already in the list', tone: 'info' })
+          continue
+        }
+        seen.add(key)
+
+        if (file.size === 0) {
+          rejected.push({ name: path, reason: 'empty file', tone: 'warn' })
+          continue
+        }
+
+        candidates.push({ file, path })
+      }
+
+      // Sniff in parallel chunks and commit each chunk as it lands, so cards
+      // start appearing almost immediately and keep appearing. Sniffing is a
+      // real disk read per file; serialising it across a photo library is
+      // seconds of a page that looks like it ignored the drop.
+      for (let start = 0; start < candidates.length; start += INGEST_BATCH) {
+        const batch = candidates.slice(start, start + INGEST_BATCH)
+        const formats = await Promise.all(batch.map(({ file }) => detectFormat(file)))
+
+        const chunk: Job[] = []
+        for (let i = 0; i < batch.length; i += 1) {
+          const { file, path } = batch[i]
+          const sourceFormat = formats[i]
           if (!sourceFormat) {
-            rejected.push({ name: file.name, reason: 'not a PNG, JPEG, WebP, AVIF or SVG' })
+            rejected.push({
+              name: path,
+              reason: 'not a PNG, JPEG, WebP, AVIF or SVG',
+              tone: 'warn',
+            })
             continue
           }
-
-          accepted.push({
+          chunk.push({
             id: newId(),
             file,
+            relativePath: path,
             sourceFormat,
             sourceWidth: null,
             sourceHeight: null,
@@ -456,27 +630,21 @@ export function useConverter(): ConverterApi {
           })
         }
 
-        if (rejected.length > 0) setNotices((prev) => [...prev, ...rejected])
-        if (accepted.length === 0) return
+        if (chunk.length === 0) continue
 
         // Show the cards immediately; dimensions stream in behind them.
-        setJobs((prev) => [...prev, ...accepted])
+        setJobs((prev) => [...prev, ...chunk])
+        setPathIndex((prev) => {
+          const next = new Map(prev)
+          for (const job of chunk) next.set(job.id, job.relativePath)
+          return next
+        })
+        probeAll(chunk)
+      }
 
-        for (const job of accepted) {
-          void probeDimensions(job.previewUrl).then((size) => {
-            if (!size) return
-            setJobs((prev) =>
-              prev.map((j) =>
-                j.id === job.id
-                  ? { ...j, sourceWidth: size.width, sourceHeight: size.height }
-                  : j,
-              ),
-            )
-          })
-        }
-      })()
+      if (rejected.length > 0) setNotices((prev) => [...prev, ...rejected])
     },
-    [createUrl],
+    [createUrl, probeAll],
   )
 
   /* ---- options ----------------------------------------------------- */
@@ -662,37 +830,96 @@ export function useConverter(): ConverterApi {
         url = createUrl(new Blob([success.bytes], { type: MIME[success.outFormat] }))
         downloadUrlsRef.current.set(id, url)
       }
-      triggerDownload(url, sanitizeName(ensureExtension(success.outName, success.outFormat)))
+      // Deliberately flat: a browser download writes one file into the
+      // downloads folder and cannot create directories, and an `a.download`
+      // containing '/' is either sanitised into one long name or ignored
+      // outright. Folder structure is the ZIP's job; a single file keeps just
+      // its own name.
+      triggerDownload(url, outputBaseOf(job, success))
     },
     [createUrl],
   )
 
   const downloadAllZip = useCallback(async (): Promise<void> => {
+    // Pair each result with its job: the bytes come from the result, but the
+    // folder it belongs in is only known to the job.
     const finished = jobsRef.current
-      .map((job) => successOf(job))
-      .filter((r): r is ConvertSuccess => r !== null)
+      .map((job) => {
+        const success = successOf(job)
+        return success === null ? null : { job, success }
+      })
+      .filter((entry): entry is { job: Job; success: ConvertSuccess } => entry !== null)
     if (finished.length === 0) return
 
     setIsZipping(true)
     try {
+      // Two passes, so a suffix minted for one file can never steal the real
+      // name of another. Claiming greedily in one pass is order-dependent:
+      // `a.png`, `a.jpg`, `a-1.png` -> the third file, which collided with
+      // nothing, came back as `a-1-1.webp` because `a.jpg` had already taken
+      // `a-1.webp`. Reserving every name that occurs exactly once first means
+      // only genuine duplicates are ever renamed.
+      const desired = finished.map(({ job, success }) => outputPathOf(job, success))
+
+      const occurrences = new Map<string, number>()
+      for (const path of desired) {
+        const key = path.toLowerCase()
+        occurrences.set(key, (occurrences.get(key) ?? 0) + 1)
+      }
+
+      /** Index -> the entry path it has been granted. */
+      const claimed = new Map<number, string>()
       const used = new Set<string>()
+
+      // Pass 1: every name exactly one file wants is reserved verbatim, before
+      // any suffix is minted, so a suffix can never consume it.
+      for (let i = 0; i < desired.length; i += 1) {
+        const key = desired[i].toLowerCase()
+        if (occurrences.get(key) !== 1) continue
+        used.add(key)
+        claimed.set(i, desired[i])
+      }
+
+      // Pass 2: inside a colliding group, the file the user *already* had under
+      // that exact name has the strongest claim to it — converting a folder of
+      // `p.png`, `p.jpg`, `p.webp` to WebP must not hand `p.webp` to `p.png`
+      // and give the original `p.webp` a suffix.
+      for (let i = 0; i < desired.length; i += 1) {
+        if (claimed.has(i)) continue
+        const uploaded = sanitizeRelativePath(finished[i].job.relativePath)
+        if (uploaded.toLowerCase() === desired[i].toLowerCase()) {
+          claimed.set(i, uniquePath(desired[i], used))
+        }
+      }
+
+      // Pass 3: the remaining true duplicates take suffixes, skipping every
+      // name reserved above.
       const entries: Record<string, Uint8Array> = {}
-      for (const success of finished) {
-        const name = uniqueName(
-          sanitizeName(ensureExtension(success.outName, success.outFormat)),
-          used,
-        )
-        entries[name] = new Uint8Array(success.bytes)
+      for (let i = 0; i < finished.length; i += 1) {
+        // fflate treats '/' in a key as a directory separator, so a nested
+        // path is all that's needed to rebuild the tree — no explicit folder
+        // entries, no extra API.
+        const entryPath = claimed.get(i) ?? uniquePath(desired[i], used)
+        entries[entryPath] = new Uint8Array(finished[i].success.bytes)
       }
 
       const archive = await zipAsync(entries)
       const url = createUrl(new Blob([toBlobPart(archive)], { type: 'application/zip' }))
-      triggerDownload(url, `converted-${finished.length}-images.zip`)
+      // Name the archive after the folder that was dropped, so it unpacks to
+      // something recognisable. Falls back to a count when the files came from
+      // different roots or were loose.
+      const root = commonRootFolder(finished.map(({ job }) => job.relativePath))
+      const zipName =
+        root.length > 0 ? `${root}-converted.zip` : `converted-${finished.length}-images.zip`
+      triggerDownload(url, zipName)
       // Revoking immediately can abort the download in some browsers; give it a
       // grace period, and let unmount catch it if the user leaves first.
       window.setTimeout(() => revokeUrl(url), 60_000)
     } catch (err) {
-      setNotices((prev) => [...prev, { name: 'ZIP archive', reason: errorMessage(err) }])
+      setNotices((prev) => [
+        ...prev,
+        { name: 'ZIP archive', reason: errorMessage(err), tone: 'warn' },
+      ])
     } finally {
       setIsZipping(false)
     }
@@ -706,6 +933,12 @@ export function useConverter(): ConverterApi {
       if (job) revokeUrl(job.previewUrl)
       releaseDownloadUrl(id)
       setJobs((prev) => prev.filter((j) => j.id !== id))
+      setPathIndex((prev) => {
+        if (!prev.has(id)) return prev
+        const next = new Map(prev)
+        next.delete(id)
+        return next
+      })
     },
     [releaseDownloadUrl, revokeUrl],
   )
@@ -721,12 +954,25 @@ export function useConverter(): ConverterApi {
     downloadUrlsRef.current.clear()
 
     setJobs([])
+    setPathIndex(new Map())
     setNotices([])
   }, [revokeUrl])
 
-  const dismissNotices = useCallback((): void => setNotices([]), [])
+  const dismissNotices = useCallback((tone?: NoticeTone): void => {
+    setNotices((prev) => (tone ? prev.filter((notice) => notice.tone !== tone) : []))
+  }, [])
 
   /* ---- derived ----------------------------------------------------- */
+
+  /**
+   * Keyed on `pathIndex`, NOT on `jobs`: paths are immutable per job, so this
+   * only has to run when a file is added or removed. Keying it on `jobs` made
+   * every status tick re-split every path in the list.
+   */
+  const rootFolder = useMemo(
+    () => commonRootFolder(Array.from(pathIndex.values())),
+    [pathIndex],
+  )
 
   const summary = useMemo<ConverterSummary>(() => {
     let queued = 0
@@ -775,6 +1021,7 @@ export function useConverter(): ConverterApi {
     isConverting,
     isZipping,
     notices,
+    rootFolder,
     addFiles,
     updateOptions,
     setOverride,

@@ -4,15 +4,26 @@
  * Presentational only. It never touches the encoder; it renders whatever the
  * job says and hands intent back up through the callbacks.
  *
- * Two details that matter more than they look:
+ * Three details that matter more than they look:
  *  - filenames truncate in the MIDDLE, because the extension is the single
  *    most informative part of an image filename;
+ *  - folder paths truncate on the LEFT, because the deepest folder is the one
+ *    that tells two identically-named files apart in a 300-file tree;
  *  - a size *increase* is coloured amber rather than hidden, because
  *    converting a photo to PNG legitimately makes it much bigger and the user
  *    deserves to notice immediately.
+ *
+ * Every accessible name here is built from the file's PATH, not its basename.
+ * In a folder tree, duplicated basenames are the normal case — `icons/light/
+ * logo.png` and `icons/dark/logo.png` — and naming both buttons "Remove
+ * logo.png" leaves a screen-reader user with an undifferentiated list.
+ *
+ * The component is memoised. A folder ingest commits thousands of times as
+ * dimensions and results stream in, and without memo every one of those
+ * commits re-renders every card in the list.
  */
 
-import { useId, useState, type ReactNode } from 'react'
+import { memo, useId, useMemo, useState, type ReactNode } from 'react'
 import {
   LOSSLESS_FORMATS,
   type ConvertOptions,
@@ -22,6 +33,9 @@ import {
 } from '../types'
 import { FormatPicker } from './FormatPicker'
 import { formatBytes, formatDuration } from '../utils/format'
+import { dirnameOf, sanitizeRelativePath } from '../utils/path'
+import { losslessNote } from '../utils/lossless'
+import { mergeOptions, outputPathOf } from '../state/useConverter'
 
 /** Truncates the stem, never the extension. */
 function middleTruncate(name: string, max = 34): string {
@@ -65,6 +79,24 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   error: 'Failed',
 }
 
+/** Decorative affordance for the folder line. Purely presentational. */
+function FolderIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-3.5 w-3.5 shrink-0 text-ink-dim/60"
+    >
+      <path d="M20 19a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7.6a2 2 0 0 1-1.6-.8L9.7 4.8A2 2 0 0 0 8.1 4H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2Z" />
+    </svg>
+  )
+}
+
 function IconButton({
   label,
   onClick,
@@ -99,17 +131,24 @@ function IconButton({
 
 export interface FileCardProps {
   job: Job
-  /** Global options already merged with this job's overrides. */
-  effectiveOptions: ConvertOptions
+  /**
+   * The GLOBAL options, not this job's merged ones.
+   *
+   * Merging happens inside, memoised per card, precisely so this prop keeps a
+   * stable identity across commits: a freshly merged object handed down from
+   * the parent would defeat the memo on every render and reintroduce the
+   * O(n) merge-the-whole-list cost the parent used to pay per commit.
+   */
+  options: ConvertOptions
   onRemove: (id: string) => void
   /** Pass null to drop the override and fall back to the global settings. */
   onOverride: (id: string, patch: Partial<ConvertOptions> | null) => void
   onDownload: (id: string) => void
 }
 
-export function FileCard({
+export const FileCard = memo(function FileCard({
   job,
-  effectiveOptions,
+  options,
   onRemove,
   onOverride,
   onDownload,
@@ -118,6 +157,11 @@ export function FileCard({
   const panelId = `${uid}-override`
   const qualityId = `${uid}-override-quality`
   const [open, setOpen] = useState(false)
+
+  const effectiveOptions = useMemo(
+    () => mergeOptions(options, job.overrides),
+    [options, job.overrides],
+  )
 
   const { file, result, status } = job
   const overridden = job.overrides !== null
@@ -136,6 +180,17 @@ export function FileCard({
       ? `${job.sourceWidth} × ${job.sourceHeight}`
       : null
 
+  /**
+   * Where this file sat in the folder the user dropped. '' for a loose
+   * root-level file, in which case the whole line is omitted rather than
+   * rendered empty — an empty element still costs a line of vertical rhythm.
+   * Both strings come from the same splitPath pass, so the tooltip can never
+   * disagree with the visible folder (e.g. backslashes in one, slashes in the
+   * other).
+   */
+  const folder = dirnameOf(job.relativePath)
+  const fullPath = sanitizeRelativePath(job.relativePath)
+
   const lossless = LOSSLESS_FORMATS.includes(effectiveOptions.target)
 
   const patchOverride = (patch: Partial<ConvertOptions>) => {
@@ -144,7 +199,7 @@ export function FileCard({
 
   return (
     <article
-      aria-label={file.name}
+      aria-label={fullPath}
       className="flex flex-col gap-4 rounded-xl border border-hairline bg-surface/70 p-4 transition-colors duration-150 hover:border-ink-dim/40"
     >
       {/* React 19 hoists and de-duplicates this by href, so N cards ship one copy. */}
@@ -158,6 +213,40 @@ export function FileCard({
         }
         @media (prefers-reduced-motion: reduce) {
           .fc-indeterminate { animation-duration: 2.6s; }
+        }
+      `}</style>
+
+      {/*
+        Left-truncation for folder paths. A path's informative end is its tail
+        (deep/nested/Iceland), so the ellipsis has to eat the *start*.
+        direction:rtl puts the line's end edge — and with it the ellipsis — on
+        the left. There is deliberately no text-align here: the span is a
+        content-sized flex item, so its box never has spare room for alignment
+        to act on, and the one property whose interaction with overflow differs
+        between engines stays out of the picture.
+
+        The inner <bdi> is load-bearing, not decoration. Under an rtl paragraph
+        the neutral characters at a string's edges take the paragraph direction,
+        so a folder named "Trip (2024)" would render as ")Trip (2024". Isolating
+        the path in its own ltr paragraph keeps every character exactly where
+        the user put it while the outer box keeps clipping from the left.
+        direction is set explicitly rather than left to <bdi>'s dir=auto so a
+        folder named in Hebrew or Arabic still reads root → leaf; only that
+        segment's own glyphs run rtl, which is correct.
+
+        Whatever bidi does, overflow:hidden is what guarantees a seven-level
+        path cannot widen the card at 375px.
+      */}
+      <style href="fc-path" precedence="medium">{`
+        .fc-path {
+          direction: rtl;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .fc-path > bdi {
+          direction: ltr;
+          unicode-bidi: isolate;
         }
       `}</style>
 
@@ -175,8 +264,26 @@ export function FileCard({
 
         {/* Identity + status */}
         <div className="flex min-w-0 flex-1 flex-col gap-2">
-          <div className="flex min-w-0 items-start justify-between gap-3">
-            <div className="min-w-0">
+          {/*
+            Below `sm` the status chip and the icon buttons drop onto their own
+            row. Side by side they took 56% of a 375px card's identity column,
+            squeezing the filename to 88px — narrow enough that the CSS
+            truncation clipped off the very extension `middleTruncate` exists
+            to protect.
+          */}
+          <div className="flex min-w-0 flex-col items-start justify-between gap-2 sm:flex-row sm:gap-3">
+            <div className="w-full min-w-0">
+              {folder ? (
+                <p
+                  title={fullPath}
+                  className="mb-1 flex min-w-0 items-center gap-1.5 text-[11px] leading-4 text-ink-dim/80"
+                >
+                  <FolderIcon />
+                  <span className="fc-path min-w-0">
+                    <bdi>{folder}</bdi>
+                  </span>
+                </p>
+              ) : null}
               <p
                 title={file.name}
                 className="truncate text-sm font-medium text-ink"
@@ -203,15 +310,20 @@ export function FileCard({
               </p>
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2 sm:w-auto">
               <span
                 className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${STATUS_STYLE[status]}`}
               >
                 {STATUS_LABEL[status]}
               </span>
               {status === 'done' && success ? (
+                /* Named from `outputPathOf`, the same source of truth the
+                   download itself uses. `success.outName` is the engine's
+                   *normalised* name and disagrees with the bytes that get
+                   saved — it would announce "Download leading.webp" for a file
+                   that lands as " leading.webp". */
                 <IconButton
-                  label={`Download ${success.outName}`}
+                  label={`Download ${outputPathOf(job, success)}`}
                   tone="accent"
                   onClick={() => onDownload(job.id)}
                 >
@@ -231,7 +343,7 @@ export function FileCard({
                   </svg>
                 </IconButton>
               ) : null}
-              <IconButton label={`Remove ${file.name}`} onClick={() => onRemove(job.id)}>
+              <IconButton label={`Remove ${fullPath}`} onClick={() => onRemove(job.id)}>
                 <svg
                   aria-hidden="true"
                   viewBox="0 0 24 24"
@@ -252,7 +364,7 @@ export function FileCard({
           {status === 'running' ? (
             <div
               role="progressbar"
-              aria-label={`Converting ${file.name}`}
+              aria-label={`Converting ${fullPath}`}
               className="h-1 w-full overflow-hidden rounded-full bg-surface-2"
             >
               <div className="fc-indeterminate h-full w-1/4 rounded-full bg-accent" />
@@ -339,54 +451,71 @@ export function FileCard({
           ) : null}
         </div>
 
-        {open ? (
-          <div id={panelId} className="mt-3 flex flex-col gap-4 rounded-lg bg-canvas/50 p-3">
-            <div className="flex flex-col gap-2">
-              <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-ink-dim">
-                Format
-              </span>
-              <FormatPicker
-                value={effectiveOptions.target}
-                onChange={(target: ImageFormat) => patchOverride({ target })}
-                idPrefix={`${uid}-job`}
-                label={`Target format for ${file.name}`}
-                size="sm"
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <div className="flex items-baseline justify-between gap-4">
-                <label htmlFor={qualityId} className="text-xs text-ink-dim">
-                  Quality
-                </label>
-                <span
-                  className={`text-xs tabular-nums ${lossless ? 'text-ink-dim/60' : 'text-accent'}`}
-                >
-                  {lossless ? '—' : effectiveOptions.quality}
+        {/*
+          Always rendered, so `aria-controls` above always resolves — mounting
+          the panel only when open left every collapsed card (their default
+          state) pointing at an element that does not exist. The Tailwind
+          `hidden` class, not just the attribute: `display:flex` from the open
+          class list would out-rank the UA rule for `[hidden]`.
+        */}
+        <div
+          id={panelId}
+          hidden={!open}
+          className={
+            open ? 'mt-3 flex flex-col gap-4 rounded-lg bg-canvas/50 p-3' : 'hidden'
+          }
+        >
+          {/* The controls themselves stay conditional: N collapsed cards should
+              not each mount a FormatPicker they are not showing. */}
+          {open ? (
+            <>
+              <div className="flex flex-col gap-2">
+                <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-ink-dim">
+                  Format
                 </span>
+                <FormatPicker
+                  value={effectiveOptions.target}
+                  onChange={(target: ImageFormat) => patchOverride({ target })}
+                  idPrefix={`${uid}-job`}
+                  label={`Target format for ${fullPath}`}
+                  size="sm"
+                />
               </div>
-              <input
-                id={qualityId}
-                type="range"
-                min={1}
-                max={100}
-                step={1}
-                value={effectiveOptions.quality}
-                disabled={lossless}
-                className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-surface-2 accent-accent focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-40"
-                onChange={(event) => patchOverride({ quality: Number(event.target.value) })}
-              />
-              <p className="text-[11px] leading-relaxed text-ink-dim">
-                {lossless
-                  ? 'PNG is lossless, so quality does nothing for this file.'
-                  : 'Applies to this file only. Everything else follows the global settings.'}
-              </p>
-            </div>
-          </div>
-        ) : null}
+
+              <div className="flex flex-col gap-2">
+                <div className="flex items-baseline justify-between gap-4">
+                  <label htmlFor={qualityId} className="text-xs text-ink-dim">
+                    Quality
+                  </label>
+                  <span
+                    className={`text-xs tabular-nums ${lossless ? 'text-ink-dim/60' : 'text-accent'}`}
+                  >
+                    {lossless ? '—' : effectiveOptions.quality}
+                  </span>
+                </div>
+                <input
+                  id={qualityId}
+                  type="range"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={effectiveOptions.quality}
+                  disabled={lossless}
+                  className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-surface-2 accent-accent focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-40"
+                  onChange={(event) => patchOverride({ quality: Number(event.target.value) })}
+                />
+                <p className="text-[11px] leading-relaxed text-ink-dim">
+                  {lossless
+                    ? losslessNote(effectiveOptions.target)
+                    : 'Applies to this file only. Everything else follows the global settings.'}
+                </p>
+              </div>
+            </>
+          ) : null}
+        </div>
       </div>
     </article>
   )
-}
+})
 
 export default FileCard
