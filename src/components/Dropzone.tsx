@@ -33,27 +33,74 @@ import {
   useState,
   type DragEvent as ReactDragEvent,
 } from 'react'
-import { FORMATS, MIME } from '../types'
+import { SOURCE_EXTENSIONS, SOURCE_FORMATS, SOURCE_LABEL, SOURCE_MIME } from '../types'
 import type { PickedFile } from '../types'
 import { createLimiter, type Limiter } from '../utils/limit'
 
-const ACCEPTED_MIME = new Set<string>([
-  ...FORMATS.map((f) => MIME[f]),
-  'image/jpg', // some systems mislabel jpeg
-])
+/**
+ * What we accept, derived from the one list in `types.ts` instead of restated
+ * here. This file used to keep its own hand-written copies of the MIME set, the
+ * extension set and the `accept` string, so adding a readable format meant
+ * remembering four places; HEIC is the format that finally made that
+ * unmaintainable, and it is now a one-line change in `types.ts`.
+ */
+const ACCEPTED_MIME = new Set<string>(
+  SOURCE_FORMATS.flatMap((format) => SOURCE_MIME[format]),
+)
 
-const ACCEPTED_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'avif', 'svg'])
+const ACCEPTED_EXT = new Set<string>(
+  SOURCE_FORMATS.flatMap((format) => SOURCE_EXTENSIONS[format]),
+)
 
-/** The `accept` attribute for the native picker. */
-const ACCEPT_ATTR = 'image/png,image/jpeg,image/webp,image/avif,image/svg+xml'
+/**
+ * The `accept` attribute for the native picker: MIME types *and* dotted
+ * extensions.
+ *
+ * Both, because for HEIC neither is sufficient alone. iOS Safari filters its
+ * photo picker on this list and can hide HEIC files outright when the entry it
+ * matches on is missing, while plenty of desktop systems report a HEIC's type
+ * as '' or `application/octet-stream`, where only the extension can match. The
+ * list is a union, not an intersection — a file shows up if it matches any
+ * entry — so naming both costs nothing.
+ */
+const ACCEPT_ATTR = [
+  ...SOURCE_FORMATS.flatMap((format) => SOURCE_MIME[format]),
+  ...SOURCE_FORMATS.flatMap((format) => SOURCE_EXTENSIONS[format].map((ext) => `.${ext}`)),
+].join(',')
 
+const SOURCE_LABELS = SOURCE_FORMATS.map((format) => SOURCE_LABEL[format])
+
+/** "PNG · JPEG · WebP · AVIF · SVG · HEIC" — the footnote inside the zone. */
+const SOURCE_LIST = SOURCE_LABELS.join(' · ')
+
+/** The same set as prose, for the skipped-files notice. */
+const SOURCE_PROSE =
+  SOURCE_LABELS.length > 1
+    ? `${SOURCE_LABELS.slice(0, -1).join(', ')} and ${SOURCE_LABELS[SOURCE_LABELS.length - 1]}`
+    : SOURCE_LABELS.join('')
+
+/** Lowercase extension without the dot, '' when the name has none. */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : ''
+}
+
+/**
+ * Accept on EITHER signal — never on `file.type` alone.
+ *
+ * `file.type` is a hint, not a fact, and HEIC is where that bites hardest: it
+ * arrives as '' from most drag sources, as `application/octet-stream` from
+ * several file managers, and occasionally as an outright wrong image type. The
+ * old rule consulted the extension only when the type was *empty*, so a
+ * non-empty unrecognised type was an immediate rejection — which silently threw
+ * away real .heic photos before the magic-byte sniffer downstream ever got to
+ * identify them. Falling through to the extension whenever the MIME doesn't
+ * match cannot admit anything the sniffer won't reject a moment later, and it
+ * stops a mislabelled file from being lost without a word.
+ */
 function isSupportedImage(file: File): boolean {
-  const type = file.type.toLowerCase()
-  if (type) return ACCEPTED_MIME.has(type)
-  // Some drag sources (and Safari paste) hand over an empty MIME type.
-  const dot = file.name.lastIndexOf('.')
-  const ext = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : ''
-  return ACCEPTED_EXT.has(ext)
+  if (ACCEPTED_MIME.has(file.type.toLowerCase())) return true
+  return ACCEPTED_EXT.has(extensionOf(file.name))
 }
 
 /* ------------------------------------------------------------------ *
@@ -551,7 +598,7 @@ export function Dropzone({ onFiles, disabled = false }: DropzoneProps) {
         </span>
 
         <span className="text-[11px] uppercase tracking-[0.14em] text-ink-dim">
-          PNG &middot; JPEG &middot; WebP &middot; AVIF &middot; SVG &middot; stays on your device
+          {SOURCE_LIST} &middot; stays on your device
         </span>
       </button>
 
@@ -606,7 +653,7 @@ export function Dropzone({ onFiles, disabled = false }: DropzoneProps) {
                   Skipped {rejected.count} non-image {rejected.count === 1 ? 'file' : 'files'}
                 </span>{' '}
                 <span className="text-amber-200/70">
-                  — only PNG, JPEG, WebP, AVIF and SVG are converted
+                  — only {SOURCE_PROSE} are converted
                 </span>
               </>
             ) : (

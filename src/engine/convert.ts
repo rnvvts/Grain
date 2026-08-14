@@ -8,7 +8,7 @@
  */
 
 import type { ConvertRequest, ConvertResult, SourceFormat } from '../types'
-import { decode } from './decode'
+import { decode, type PhaseReporter } from './decode'
 import { encode } from './encode'
 import { applyResize } from './resize'
 import { outputName, sniffFormat } from './format'
@@ -27,8 +27,16 @@ function errorMessage(cause: unknown): string {
  * The source format is re-detected from the bytes rather than trusted from the
  * request, because the request's `sourceFormat` was usually guessed from a
  * filename and filenames lie.
+ *
+ * `report`, when given, is called as the decode moves between phases the user
+ * can feel. Today only HEIC ever calls it, and only on the first HEIC a worker
+ * sees: that is the one conversion that stops for a 1.4 MB download before any
+ * pixel work begins.
  */
-export async function convertImage(req: ConvertRequest): Promise<ConvertResult> {
+export async function convertImage(
+  req: ConvertRequest,
+  report?: PhaseReporter,
+): Promise<ConvertResult> {
   const startedAt = performance.now()
 
   try {
@@ -36,7 +44,7 @@ export async function convertImage(req: ConvertRequest): Promise<ConvertResult> 
     const target = req.options.target
     const format: SourceFormat = sniffFormat(req.bytes) ?? req.sourceFormat
 
-    const decoded = await decode(req.bytes, format)
+    const decoded = await decode(req.bytes, format, report)
     const resized = applyResize(decoded, req.options.resize)
     const bytes = await encode(resized, req.options)
 

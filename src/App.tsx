@@ -3,6 +3,7 @@ import { FileCard } from './components/FileCard'
 import { OptionsPanel } from './components/OptionsPanel'
 import { Stat } from './components/Stat'
 import { useConverter, type Notice, type NoticeTone } from './state/useConverter'
+import { isSourceOnly } from './types'
 import { formatBytes, formatPercent, formatSignedBytes } from './utils/format'
 
 /* ---- shared class strings ------------------------------------------ */
@@ -92,6 +93,7 @@ export default function App() {
     isZipping,
     notices,
     rootFolder,
+    decoderFetchIds,
     addFiles,
     updateOptions,
     setOverride,
@@ -118,6 +120,14 @@ export default function App() {
   const warnings = notices.filter((notice) => notice.tone === 'warn')
   const duplicates = notices.filter((notice) => notice.tone === 'info')
 
+  /*
+   * Derived here rather than asked of the hook: every job already carries its
+   * own source format, so the one-line HEIC explanation needs no new API. The
+   * scan short-circuits on the first match and is a rounding error beside
+   * rendering the cards it sits next to.
+   */
+  const hasSourceOnlyInput = jobs.some((job) => isSourceOnly(job.sourceFormat))
+
   const settled = summary.done + summary.error
   const progress = summary.total > 0 ? (settled / summary.total) * 100 : 0
 
@@ -132,8 +142,8 @@ export default function App() {
           </div>
 
           <p className="mt-3 max-w-2xl text-base text-ink-dim sm:text-lg">
-            Convert between PNG, JPEG, WebP, AVIF and SVG — resize, re-quantise and batch a
-            whole folder at once.
+            Convert between PNG, JPEG, WebP, AVIF and SVG, and read the HEIC photos an
+            iPhone shoots — resize, re-quantise and batch a whole folder at once.
           </p>
 
           <p className="mt-2 max-w-2xl text-sm leading-relaxed text-ink-dim">
@@ -185,6 +195,21 @@ export default function App() {
         <main className="mt-8 grid gap-8 lg:grid-cols-[19rem_minmax(0,1fr)] lg:items-start">
           <aside className="min-w-0 lg:sticky lg:top-6">
             <OptionsPanel options={options} onChange={updateOptions} />
+
+            {/*
+              Shown only once a HEIC is actually in the queue, in the panel's own
+              quiet colours. It answers the question the picker provokes — "where
+              is HEIC?" — rather than warning about anything: converting a HEIC
+              to WebP is the ordinary, intended outcome.
+            */}
+            {hasSourceOnlyInput && (
+              <p className="mt-3 px-1 text-xs leading-relaxed text-ink-dim">
+                HEIC goes in, but never comes out. Your iPhone photos are read and converted
+                to whichever format you pick above; HEIC itself isn't offered as an output,
+                because its HEVC encoder is patent-encumbered and no browser or WASM build
+                ships one.
+              </p>
+            )}
           </aside>
 
           <section className="min-w-0">
@@ -266,6 +291,10 @@ export default function App() {
                       <FileCard
                         job={job}
                         options={options}
+                        /* A boolean, not the Set: the cards that are not
+                           fetching keep the same `false` across commits and
+                           stay memoised. */
+                        fetchingDecoder={decoderFetchIds.has(job.id)}
                         onRemove={removeJob}
                         onOverride={setOverride}
                         onDownload={downloadOne}
@@ -342,10 +371,18 @@ export default function App() {
         {/* ---------------- footer ---------------- */}
         <footer className="mt-16 border-t border-hairline pt-6 text-xs leading-relaxed text-ink-dim">
           <p>
-            No accounts, no cookies, no analytics, no network requests once the page has loaded.
-            PNG, JPEG and WebP are encoded by the browser itself; AVIF is encoded by a WebAssembly
-            build of libavif shipped with this page, because no browser can write AVIF natively.
-            SVG output wraps a PNG in a vector container — it doesn't trace real vector paths.
+            No accounts, no cookies, no analytics. The only thing this page ever fetches is more
+            of its own code, and your images are never part of it. PNG, JPEG and WebP are encoded
+            by the browser itself; AVIF is encoded by a WebAssembly build of libavif shipped with
+            this page, because no browser can write AVIF natively.
+          </p>
+          <p className="mt-2">
+            HEIC is read by a WebAssembly build of libheif, downloaded from this site the first
+            time you actually convert one and never before — it's 1.4 MB, and most people never
+            touch a HEIC. Reading is all it will ever do: a HEIC holds an HEVC image, and the HEVC
+            encoder is patent-encumbered, so there is none to ship and HEIC cannot be an output
+            format. SVG output wraps a PNG in a vector container — it doesn't trace real vector
+            paths.
           </p>
         </footer>
       </div>

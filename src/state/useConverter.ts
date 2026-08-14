@@ -22,8 +22,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { zip } from 'fflate'
 import { ConverterPool } from '../workers/pool'
 import { sniffFormat } from '../engine/format'
-import { UNDECODABLE_SVG_MESSAGE } from '../engine/decode'
-import { DEFAULT_OPTIONS, EXTENSION, MIME } from '../types'
+import { UNDECODABLE_SVG_MESSAGE, type DecodePhase } from '../engine/decode'
+import {
+  DEFAULT_OPTIONS,
+  EXTENSION,
+  MIME,
+  SOURCE_EXTENSIONS,
+  SOURCE_FORMATS,
+  SOURCE_LABEL,
+  SOURCE_MIME,
+} from '../types'
 import {
   commonRootFolder,
   sanitizeRelativePath,
@@ -102,6 +110,16 @@ export interface ConverterApi {
    */
   rootFolder: string
   /**
+   * Ids of jobs stalled on the one-off HEIC decoder download.
+   *
+   * Kept beside `jobs` rather than inside them because `Job` is part of the
+   * frozen contract in types.ts, and because this is not part of a job's
+   * lifecycle: it is a transient note about *why* a running job is taking so
+   * long, and it is dropped the moment the job settles. Empty for every session
+   * that never converts a HEIC, and for every HEIC after the first in a worker.
+   */
+  decoderFetchIds: ReadonlySet<string>
+  /**
    * Takes files *with their folder paths*, so the export can mirror the upload.
    * Resolves once every file has been sniffed and committed, so the caller can
    * keep a busy affordance up for the whole ingest.
@@ -174,26 +192,37 @@ function newId(): string {
 // run to several hundred bytes) before the actual `<svg` tag appears.
 const HEAD_BYTES = 4096
 
-const MIME_TO_FORMAT: Record<string, SourceFormat> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpeg',
-  'image/jpg': 'jpeg',
-  'image/pjpeg': 'jpeg',
-  'image/webp': 'webp',
-  'image/avif': 'avif',
-  'image/svg+xml': 'svg',
+/**
+ * Invert one of the per-format hint tables in `types.ts` into a flat
+ * hint -> format lookup.
+ *
+ * Built from those tables rather than hand-listed here: the two maps this
+ * replaces were a second copy of the same knowledge, and a copy is exactly how
+ * a newly readable format ends up recognised by the picker but rejected by the
+ * ingest. A format is now added in one place, `types.ts`, and both ends follow.
+ */
+function indexHints(
+  table: Record<SourceFormat, readonly string[]>,
+): Record<string, SourceFormat> {
+  const index: Record<string, SourceFormat> = {}
+  for (const format of SOURCE_FORMATS) {
+    for (const hint of table[format]) index[hint.toLowerCase()] = format
+  }
+  return index
 }
 
-const EXT_TO_FORMAT: Record<string, SourceFormat> = {
-  png: 'png',
-  jpg: 'jpeg',
-  jpeg: 'jpeg',
-  jpe: 'jpeg',
-  jfif: 'jpeg',
-  webp: 'webp',
-  avif: 'avif',
-  svg: 'svg',
+const MIME_TO_FORMAT: Record<string, SourceFormat> = indexHints(SOURCE_MIME)
+
+const EXT_TO_FORMAT: Record<string, SourceFormat> = indexHints(SOURCE_EXTENSIONS)
+
+/** "PNG, JPEG, WebP, AVIF, SVG or HEIC" — everything we can read, in prose. */
+function readableFormatList(): string {
+  const labels = SOURCE_FORMATS.map((format) => SOURCE_LABEL[format])
+  if (labels.length < 2) return labels.join('')
+  return `${labels.slice(0, -1).join(', ')} or ${labels[labels.length - 1]}`
 }
+
+const UNSUPPORTED_REASON = `not a ${readableFormatList()}`
 
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.')
@@ -207,6 +236,13 @@ function extensionOf(name: string): string {
  * actually runs the conversion. File.type is authoritative only as a last
  * resort: it's empty for a lot of drag sources and outright wrong for files
  * renamed by hand.
+ *
+ * Bytes first matters most for HEIC. It shares its ISO-BMFF container with
+ * AVIF, so only the `ftyp` brand tells them apart, and the hints are unusually
+ * unreliable for it — an iPhone photo routinely arrives with no MIME type at
+ * all, and a `.heic` that is really a JPEG (renamed, or re-encoded by a share
+ * sheet) has to convert as the JPEG it is. Both fall out of asking the bytes
+ * before asking the name.
  */
 async function detectFormat(file: File): Promise<SourceFormat | null> {
   try {
@@ -304,6 +340,14 @@ const EXTENSION_PATTERN = /^[A-Za-z0-9]{1,8}$/
 /**
  * The output *filename* for a finished job, with no directory part: the user's
  * own filename with its extension swapped, and nothing else touched.
+ *
+ * The new extension comes from `success.outFormat` — the TARGET — and never
+ * from `job.sourceFormat`. That is not a stylistic preference: a source format
+ * need not have any output representation at all. HEIC is decode-only (its
+ * payload is HEVC, which no free encoder will ever produce here), so it is a
+ * `SourceFormat` and not an `ImageFormat`, and `EXTENSION`/`MIME` are keyed by
+ * `ImageFormat` precisely so that naming a file after where it came from cannot
+ * compile. A HEIC in, a WebP out, named `.webp`.
  *
  * The stem is read from the job's `relativePath`, NOT from `success.outName`.
  * The engine's `outputName` normalises what it is handed — it trims surrounding
@@ -434,6 +478,8 @@ export function useConverter(): ConverterApi {
   const [notices, setNotices] = useState<Notice[]>([])
   const [isConverting, setIsConverting] = useState(false)
   const [isZipping, setIsZipping] = useState(false)
+  /** See ConverterApi.decoderFetchIds. */
+  const [decoderFetchIds, setDecoderFetchIds] = useState<ReadonlySet<string>>(new Set())
 
   /**
    * jobId -> relativePath, replaced only when the list's *membership* changes.
@@ -609,11 +655,7 @@ export function useConverter(): ConverterApi {
           const { file, path } = batch[i]
           const sourceFormat = formats[i]
           if (!sourceFormat) {
-            rejected.push({
-              name: path,
-              reason: 'not a PNG, JPEG, WebP, AVIF or SVG',
-              tone: 'warn',
-            })
+            rejected.push({ name: path, reason: UNSUPPORTED_REASON, tone: 'warn' })
             continue
           }
           chunk.push({
@@ -713,6 +755,22 @@ export function useConverter(): ConverterApi {
 
   /* ---- conversion -------------------------------------------------- */
 
+  /**
+   * Record (or clear) "this job is waiting on the decoder download".
+   *
+   * Returns the previous set unchanged when nothing moved, so the common case —
+   * every non-HEIC job, and every HEIC after the first — costs no commit at all.
+   */
+  const setDecoderFetching = useCallback((id: string, fetching: boolean): void => {
+    setDecoderFetchIds((prev) => {
+      if (prev.has(id) === fetching) return prev
+      const next = new Set(prev)
+      if (fetching) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }, [])
+
   const runJob = useCallback(
     async (pool: ConverterPool, job: Job, batchOptions: ConvertOptions, token: number) => {
       const stale = () => runTokenRef.current !== token
@@ -734,6 +792,13 @@ export function useConverter(): ConverterApi {
         // worker, and keep the *original* file size for reporting so
         // "input size" reflects the .svg the user dropped in, not the PNG it
         // became.
+        //
+        // SVG is the ONLY format that takes this detour, and the test is an
+        // equality against 'svg' rather than "is this format unusual", so HEIC
+        // cannot drift into it: HEIC sniffs as 'heic' and goes to the worker
+        // like every raster format. That is where it belongs — its decoder is
+        // a 1.4 MB WASM bundle pulled in on demand, and running it here would
+        // freeze the UI for the length of every HEIC in the batch.
         const isSvgSource = sniffFormat(fileBytes) === 'svg'
         const bytes = isSvgSource ? await decodeSvgOnMainThread(fileBytes) : fileBytes
         if (stale()) return
@@ -747,7 +812,10 @@ export function useConverter(): ConverterApi {
           options: mergeOptions(batchOptions, job.overrides),
         }
 
-        const result = await pool.run(request)
+        const result = await pool.run(request, (phase: DecodePhase) => {
+          if (stale()) return
+          setDecoderFetching(job.id, phase === 'loading-decoder')
+        })
         if (stale()) return
 
         setJobs((prev) =>
@@ -761,9 +829,14 @@ export function useConverter(): ConverterApi {
         setJobs((prev) =>
           prev.map((j) => (j.id === job.id ? { ...j, status: 'error', result: failure } : j)),
         )
+      } finally {
+        // Every exit — settled, failed, or abandoned as stale — clears the note.
+        // A job that leaves "fetching the decoder" on screen after it has
+        // stopped running is worse than never having said it.
+        setDecoderFetching(job.id, false)
       }
     },
-    [releaseDownloadUrl],
+    [releaseDownloadUrl, setDecoderFetching],
   )
 
   const convertAll = useCallback(async (): Promise<void> => {
@@ -813,6 +886,7 @@ export function useConverter(): ConverterApi {
     runningRef.current = false
     poolRef.current?.cancelAll()
     setIsConverting(false)
+    setDecoderFetchIds(new Set())
     setJobs((prev) => prev.map((j) => (j.status === 'running' ? { ...j, status: 'queued' } : j)))
   }, [])
 
@@ -932,6 +1006,7 @@ export function useConverter(): ConverterApi {
       const job = jobsRef.current.find((j) => j.id === id)
       if (job) revokeUrl(job.previewUrl)
       releaseDownloadUrl(id)
+      setDecoderFetching(id, false)
       setJobs((prev) => prev.filter((j) => j.id !== id))
       setPathIndex((prev) => {
         if (!prev.has(id)) return prev
@@ -940,7 +1015,7 @@ export function useConverter(): ConverterApi {
         return next
       })
     },
-    [releaseDownloadUrl, revokeUrl],
+    [releaseDownloadUrl, revokeUrl, setDecoderFetching],
   )
 
   const clearAll = useCallback((): void => {
@@ -956,6 +1031,7 @@ export function useConverter(): ConverterApi {
     setJobs([])
     setPathIndex(new Map())
     setNotices([])
+    setDecoderFetchIds(new Set())
   }, [revokeUrl])
 
   const dismissNotices = useCallback((tone?: NoticeTone): void => {
@@ -1022,6 +1098,7 @@ export function useConverter(): ConverterApi {
     isZipping,
     notices,
     rootFolder,
+    decoderFetchIds,
     addFiles,
     updateOptions,
     setOverride,

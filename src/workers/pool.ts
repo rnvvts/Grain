@@ -7,7 +7,9 @@
  * the promise that asked for it.
  */
 
+import { HEIC_DECODER_UNAVAILABLE_MESSAGE, type DecodePhase } from '../engine/decode'
 import type { ConvertFailure, ConvertRequest, ConvertResult } from '../types'
+import { isProgress, type ConvertProgress } from './protocol'
 
 /**
  * Hard cap on concurrent workers.
@@ -34,9 +36,13 @@ function fail(id: string, error: string): ConvertFailure {
   return { id, ok: false, error }
 }
 
+/** Progress notes for one job. Optional, and never affects how it settles. */
+export type ProgressListener = (phase: DecodePhase) => void
+
 interface PendingJob {
   readonly request: ConvertRequest
   readonly resolve: (result: ConvertResult) => void
+  readonly onProgress?: ProgressListener
   settled: boolean
 }
 
@@ -90,8 +96,13 @@ export class ConverterPool {
    *
    * The returned promise never rejects: failures arrive as a ConvertFailure so
    * a batch can be driven with `Promise.all` without one bad file killing it.
+   *
+   * `onProgress` is called for notes the worker posts mid-job (today: "I am
+   * downloading the HEIC decoder"). It is purely informational — a job that
+   * reports nothing behaves exactly as before — and stops being called the
+   * moment the job settles, is cancelled, or its worker dies.
    */
-  run(request: ConvertRequest): Promise<ConvertResult> {
+  run(request: ConvertRequest, onProgress?: ProgressListener): Promise<ConvertResult> {
     if (this.disposed) {
       return Promise.resolve(fail(request.id, 'Converter pool has been terminated'))
     }
@@ -100,7 +111,7 @@ export class ConverterPool {
     }
 
     return new Promise<ConvertResult>((resolve) => {
-      const job: PendingJob = { request, resolve, settled: false }
+      const job: PendingJob = { request, resolve, onProgress, settled: false }
       this.pendingIds.add(request.id)
       this.queue.push(job)
       this.pump()
@@ -241,11 +252,20 @@ export class ConverterPool {
   private attach(slot: WorkerSlot): void {
     const worker = slot.worker
 
-    worker.addEventListener('message', (event: MessageEvent<ConvertResult>) => {
-      // Ignore anything arriving from a worker this slot has already replaced.
-      if (slot.worker !== worker) return
-      this.handleResult(slot, event.data)
-    })
+    worker.addEventListener(
+      'message',
+      (event: MessageEvent<ConvertResult | ConvertProgress>) => {
+        // Ignore anything arriving from a worker this slot has already replaced.
+        if (slot.worker !== worker) return
+        // Progress notes are not results: they must not settle anything, and a
+        // job that is already gone (cancelled, removed) simply drops them.
+        if (isProgress(event.data)) {
+          this.inFlight.get(event.data.id)?.job.onProgress?.(event.data.phase)
+          return
+        }
+        this.handleResult(slot, event.data)
+      },
+    )
 
     worker.addEventListener('error', (event) => {
       if (slot.worker !== worker) return
@@ -274,8 +294,21 @@ export class ConverterPool {
     }
 
     this.inFlight.delete(result.id)
-    slot.jobId = null
     this.settle(entry.job, result)
+
+    if (isPoisoned(result)) {
+      // The worker failed to fetch the HEIC decoder chunk, and a failed dynamic
+      // `import()` is recorded in that realm's module map for good: every later
+      // `import()` of the same specifier re-serves the stored failure without
+      // touching the network. Dropping the promise cache inside the worker
+      // cannot undo that, so the worker itself is the thing that has to go.
+      // Without this, "try this file again" is a promise the app cannot keep —
+      // the retry lands on the same lane and fails identically, with no request
+      // ever leaving the browser.
+      this.replaceWorker(slot)
+    } else {
+      slot.jobId = null
+    }
     this.pump()
   }
 
@@ -305,6 +338,18 @@ export class ConverterPool {
     slot.worker = this.createWorker()
     this.attach(slot)
   }
+}
+
+/**
+ * Did this failure leave the worker permanently unable to do that kind of job?
+ *
+ * Matched on the message because ConvertFailure carries nothing else (types.ts
+ * is the frozen contract between three modules and gains no field for this).
+ * The constant is imported rather than spelled out here so the two ends cannot
+ * drift apart silently.
+ */
+function isPoisoned(result: ConvertResult): boolean {
+  return !result.ok && result.error === HEIC_DECODER_UNAVAILABLE_MESSAGE
 }
 
 function describe(value: unknown, fallback: string): string {

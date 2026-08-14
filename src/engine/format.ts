@@ -54,16 +54,21 @@ function startsWith(bytes: Uint8Array, signature: readonly number[]): boolean {
 }
 
 /**
- * An AVIF file starts with an `ftyp` box: [size:4]["ftyp"][major:4][minor:4]
- * followed by a list of 4-byte compatible brands.
+ * Classify an ISO-BMFF image container, which starts with an `ftyp` box:
+ * [size:4]["ftyp"][major:4][minor:4] then a list of 4-byte compatible brands.
+ *
+ * AVIF and HEIC are the SAME container family distinguished only by the codec
+ * their brands advertise — AV1 for AVIF, HEVC for HEIC. That is why one
+ * function decides both: a lone `isAvif` predicate could only ever answer
+ * "not AVIF" for a HEIC, throwing away the very bit that identifies it.
  */
-function isAvif(bytes: Uint8Array): boolean {
-  if (ascii(bytes, 4, 4) !== 'ftyp') return false
+function classifyIsoBmff(bytes: Uint8Array): 'avif' | 'heic' | null {
+  if (ascii(bytes, 4, 4) !== 'ftyp') return null
 
   const major = ascii(bytes, 8, 4)
-  if (AVIF_BRANDS.has(major)) return true
-  if (HEVC_BRANDS.has(major)) return false
-  if (!HEIF_CONTAINER_BRANDS.has(major)) return false
+  if (AVIF_BRANDS.has(major)) return 'avif'
+  if (HEVC_BRANDS.has(major)) return 'heic'
+  if (!HEIF_CONTAINER_BRANDS.has(major)) return null
 
   // Generic container brand (e.g. 'mif1'): scan the compatible-brand list,
   // which lives between the end of the minor version and the end of the box.
@@ -73,12 +78,13 @@ function isAvif(bytes: Uint8Array): boolean {
   let sawHevc = false
   for (let offset = 16; offset + 4 <= end; offset += 4) {
     const brand = ascii(bytes, offset, 4)
-    if (AVIF_BRANDS.has(brand)) return true
+    if (AVIF_BRANDS.has(brand)) return 'avif'
     if (HEVC_BRANDS.has(brand)) sawHevc = true
   }
-  // A bare 'mif1' container with no codec brand at all is treated as AVIF;
-  // one that explicitly advertises HEVC is not something we can decode.
-  return !sawHevc
+  if (sawHevc) return 'heic'
+  // A bare 'mif1' container advertising no codec at all: treat as AVIF, which
+  // is what the browser's own decoder will most likely make of it too.
+  return 'avif'
 }
 
 /**
@@ -122,7 +128,9 @@ export function sniffFormat(bytes: ArrayBuffer): SourceFormat | null {
   // WebP: "RIFF" [size:4] "WEBP"
   if (ascii(head, 0, 4) === 'RIFF' && ascii(head, 8, 4) === 'WEBP') return 'webp'
 
-  if (isAvif(head)) return 'avif'
+  // AVIF and HEIC share the ISO-BMFF container; one pass decides between them.
+  const isoBmff = classifyIsoBmff(head)
+  if (isoBmff !== null) return isoBmff
 
   if (isSvg(head)) return 'svg'
 

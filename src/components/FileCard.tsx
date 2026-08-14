@@ -26,6 +26,8 @@
 import { memo, useId, useMemo, useState, type ReactNode } from 'react'
 import {
   LOSSLESS_FORMATS,
+  SOURCE_LABEL,
+  isSourceOnly,
   type ConvertOptions,
   type ImageFormat,
   type Job,
@@ -78,6 +80,16 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   done: 'Done',
   error: 'Failed',
 }
+
+/**
+ * What a running job says while it is stalled on the HEIC decoder download.
+ *
+ * The chip is the only thing most people look at, and "Converting" on a card
+ * that will not move for the length of a 1.4 MB fetch — half a minute on a slow
+ * connection — reads as a hang. Naming the fetch is the difference between "it
+ * is broken" and "it is downloading something, once".
+ */
+const FETCHING_DECODER_LABEL = 'Fetching decoder'
 
 /** Decorative affordance for the folder line. Purely presentational. */
 function FolderIcon() {
@@ -140,6 +152,13 @@ export interface FileCardProps {
    * O(n) merge-the-whole-list cost the parent used to pay per commit.
    */
   options: ConvertOptions
+  /**
+   * True while this job is waiting on the one-off HEIC decoder download rather
+   * than on any pixel work. A plain boolean on purpose: it keeps the memo
+   * effective (only the one card that is actually fetching re-renders) and
+   * keeps the frozen `Job` shape untouched.
+   */
+  fetchingDecoder?: boolean
   onRemove: (id: string) => void
   /** Pass null to drop the override and fall back to the global settings. */
   onOverride: (id: string, patch: Partial<ConvertOptions> | null) => void
@@ -149,6 +168,7 @@ export interface FileCardProps {
 export const FileCard = memo(function FileCard({
   job,
   options,
+  fetchingDecoder = false,
   onRemove,
   onOverride,
   onDownload,
@@ -157,6 +177,24 @@ export const FileCard = memo(function FileCard({
   const panelId = `${uid}-override`
   const qualityId = `${uid}-override-quality`
   const [open, setOpen] = useState(false)
+
+  /**
+   * True once the browser has told us it cannot paint this file's preview.
+   *
+   * HEIC is why this exists. The thumbnail is an `<img>` pointed at an object
+   * URL for the original file, which works for every format the *browser* can
+   * decode — and Chrome, Edge and Firefox decode no HEIC at all. (Grain still
+   * converts it: the actual decode is libheif in a worker, which has nothing to
+   * do with what `<img>` can display.) Left alone, every iPhone photo on those
+   * browsers renders the broken-image glyph, which reads as "this file is
+   * damaged" for a file that is about to convert perfectly well.
+   *
+   * Driven by the `error` event rather than by `isSourceOnly(job.sourceFormat)`,
+   * because the question is what THIS browser can paint, not what format the
+   * file is: Safari shows HEIC thumbnails fine and should keep them, and a
+   * truncated PNG gets the same graceful treatment for free.
+   */
+  const [previewFailed, setPreviewFailed] = useState(false)
 
   const effectiveOptions = useMemo(
     () => mergeOptions(options, job.overrides),
@@ -192,6 +230,20 @@ export const FileCard = memo(function FileCard({
   const fullPath = sanitizeRelativePath(job.relativePath)
 
   const lossless = LOSSLESS_FORMATS.includes(effectiveOptions.target)
+
+  /**
+   * True for a format we can read but can never write — HEIC today, since its
+   * HEVC payload has no shippable encoder. It earns a tooltip and nothing more.
+   * A file that goes in as HEIC and comes out as WebP has done exactly what it
+   * was supposed to do, so there is no warning colour and no icon here.
+   */
+  const sourceOnly = isSourceOnly(job.sourceFormat)
+
+  /**
+   * Running, but not on this file yet: the worker is still downloading libheif.
+   * Guarded on `status` so a stale flag can never outlive the run it describes.
+   */
+  const waitingOnDecoder = status === 'running' && fetchingDecoder
 
   const patchOverride = (patch: Partial<ConvertOptions>) => {
     onOverride(job.id, { ...(job.overrides ?? {}), ...patch })
@@ -253,13 +305,26 @@ export const FileCard = memo(function FileCard({
       <div className="flex items-start gap-4">
         {/* Thumbnail */}
         <div className="h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-hairline bg-[repeating-conic-gradient(#171d28_0_25%,#10141c_0_50%)] bg-[length:12px_12px]">
-          <img
-            src={job.previewUrl}
-            alt=""
-            loading="lazy"
-            decoding="async"
-            className="h-full w-full object-contain"
-          />
+          {previewFailed ? (
+            // The format name, centred on the same checkerboard the real
+            // thumbnail sits on. It says "this is a HEIC and we know it" where
+            // the broken-image glyph said "this file is unreadable".
+            <span
+              title={`${SOURCE_LABEL[job.sourceFormat]} — this browser can't display a preview, but the file still converts`}
+              className="flex h-full w-full items-center justify-center font-mono text-[10px] uppercase tracking-wide text-ink-dim"
+            >
+              {SOURCE_LABEL[job.sourceFormat]}
+            </span>
+          ) : (
+            <img
+              src={job.previewUrl}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onError={() => setPreviewFailed(true)}
+              className="h-full w-full object-contain"
+            />
+          )}
         </div>
 
         {/* Identity + status */}
@@ -291,8 +356,22 @@ export const FileCard = memo(function FileCard({
                 {middleTruncate(file.name)}
               </p>
               <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink-dim">
-                <span className="rounded border border-hairline bg-canvas px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-dim">
-                  {job.sourceFormat}
+                {/*
+                  SOURCE_LABEL, not a Record<ImageFormat, …>: `sourceFormat` is
+                  a SourceFormat, which includes formats that have no output
+                  representation at all, so an ImageFormat-keyed table would not
+                  even type-check here. Rendering the raw union member happened
+                  to look right only because of the `uppercase` class.
+                */}
+                <span
+                  title={
+                    sourceOnly
+                      ? `${SOURCE_LABEL[job.sourceFormat]} input — read only, converted to the format you picked`
+                      : undefined
+                  }
+                  className="rounded border border-hairline bg-canvas px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-dim"
+                >
+                  {SOURCE_LABEL[job.sourceFormat]}
                 </span>
                 <span aria-hidden="true" className="text-ink-dim/50">
                   →
@@ -314,7 +393,7 @@ export const FileCard = memo(function FileCard({
               <span
                 className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${STATUS_STYLE[status]}`}
               >
-                {STATUS_LABEL[status]}
+                {waitingOnDecoder ? FETCHING_DECODER_LABEL : STATUS_LABEL[status]}
               </span>
               {status === 'done' && success ? (
                 /* Named from `outputPathOf`, the same source of truth the
@@ -362,12 +441,30 @@ export const FileCard = memo(function FileCard({
 
           {/* Progress / result line */}
           {status === 'running' ? (
-            <div
-              role="progressbar"
-              aria-label={`Converting ${fullPath}`}
-              className="h-1 w-full overflow-hidden rounded-full bg-surface-2"
-            >
-              <div className="fc-indeterminate h-full w-1/4 rounded-full bg-accent" />
+            <div className="flex flex-col gap-1.5">
+              <div
+                role="progressbar"
+                aria-label={
+                  waitingOnDecoder
+                    ? `Downloading the HEIC decoder before converting ${fullPath}`
+                    : `Converting ${fullPath}`
+                }
+                className="h-1 w-full overflow-hidden rounded-full bg-surface-2"
+              >
+                <div className="fc-indeterminate h-full w-1/4 rounded-full bg-accent" />
+              </div>
+              {/*
+                Only ever shown for the first HEIC of a run, and only while the
+                fetch is actually outstanding. The size is named because that is
+                the number that explains the wait, and "once" because the second
+                HEIC will not wait at all.
+              */}
+              {waitingOnDecoder ? (
+                <p className="text-[11px] leading-relaxed text-ink-dim">
+                  Downloading the HEIC decoder — 1.4 MB, fetched once. Converting starts as
+                  soon as it lands.
+                </p>
+              ) : null}
             </div>
           ) : null}
 

@@ -13,6 +13,7 @@
 
 import { convertImage } from '../engine/convert'
 import type { ConvertFailure, ConvertRequest, ConvertResult } from '../types'
+import type { ConvertProgress } from './protocol'
 
 /**
  * Minimal shape of the dedicated-worker global.
@@ -24,7 +25,7 @@ import type { ConvertFailure, ConvertRequest, ConvertResult } from '../types'
  */
 interface DedicatedWorkerScope {
   onmessage: ((event: MessageEvent<ConvertRequest>) => void) | null
-  postMessage(message: ConvertResult, transfer?: Transferable[]): void
+  postMessage(message: ConvertResult | ConvertProgress, transfer?: Transferable[]): void
 }
 
 const ctx = self as unknown as DedicatedWorkerScope
@@ -49,7 +50,12 @@ function fail(id: string, error: string): ConvertFailure {
 
 async function handle(request: ConvertRequest): Promise<void> {
   try {
-    const result = await convertImage(request)
+    // Progress notes are fire-and-forget: they carry the job id so the pool can
+    // route them, and the job still settles on its ConvertResult alone. Posting
+    // one costs a structured clone of two short strings.
+    const result = await convertImage(request, (phase) => {
+      ctx.postMessage({ id: request.id, phase })
+    })
 
     if (result.ok) {
       // Transfer the encoded bytes rather than structured-cloning them. These

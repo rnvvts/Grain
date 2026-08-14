@@ -19,10 +19,64 @@
  */
 export type ImageFormat = 'png' | 'jpeg' | 'webp' | 'avif' | 'svg'
 
-/** Everything we can read. Superset of ImageFormat in case we add decode-only formats. */
-export type SourceFormat = ImageFormat
+/**
+ * Everything we can READ. A strict superset of ImageFormat.
+ *
+ * HEIC is the reason this split finally exists. It is decode-only and always
+ * will be: the payload is HEVC, whose encoder is patent-encumbered, and the
+ * WASM build of libheif ships no `HeifEncoder` at all. Nothing can be
+ * converted *to* HEIC here, so it must never appear in the target picker —
+ * which is exactly what keeping it out of `ImageFormat` guarantees at the type
+ * level rather than by convention.
+ */
+export type SourceFormat = ImageFormat | 'heic'
 
+/** Formats offered as conversion TARGETS. Drives the format picker. */
 export const FORMATS: readonly ImageFormat[] = ['png', 'jpeg', 'webp', 'avif', 'svg']
+
+/** Formats accepted as INPUT. */
+export const SOURCE_FORMATS: readonly SourceFormat[] = [...FORMATS, 'heic']
+
+/** Readable at input, impossible to produce at output. */
+export const SOURCE_ONLY_FORMATS: readonly SourceFormat[] = ['heic']
+
+export function isSourceOnly(format: SourceFormat): boolean {
+  return SOURCE_ONLY_FORMATS.includes(format)
+}
+
+/** Display label for any format, source or target. */
+export const SOURCE_LABEL: Record<SourceFormat, string> = {
+  png: 'PNG',
+  jpeg: 'JPEG',
+  webp: 'WebP',
+  avif: 'AVIF',
+  svg: 'SVG',
+  heic: 'HEIC',
+}
+
+/**
+ * MIME types seen in the wild for each input format, for the picker's `accept`
+ * attribute and for File.type hints. HEIC has two spellings and iOS sometimes
+ * reports neither, which is why magic-byte sniffing stays authoritative.
+ */
+export const SOURCE_MIME: Record<SourceFormat, readonly string[]> = {
+  png: ['image/png'],
+  jpeg: ['image/jpeg', 'image/jpg', 'image/pjpeg'],
+  webp: ['image/webp'],
+  avif: ['image/avif'],
+  svg: ['image/svg+xml'],
+  heic: ['image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence'],
+}
+
+/** Filename extensions per input format, lowercase and without the dot. */
+export const SOURCE_EXTENSIONS: Record<SourceFormat, readonly string[]> = {
+  png: ['png'],
+  jpeg: ['jpg', 'jpeg', 'jpe', 'jfif'],
+  webp: ['webp'],
+  avif: ['avif'],
+  svg: ['svg'],
+  heic: ['heic', 'heif', 'hif'],
+}
 
 /** Canonical file extension written for each output format. */
 export const EXTENSION: Record<ImageFormat, string> = {
