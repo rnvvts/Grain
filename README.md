@@ -162,3 +162,31 @@ This is the one feature that is **not** private in the sense described above:
 the link you paste is sent to YouTube (by yt-dlp, from your machine). Only save
 videos you made or have permission to download; doing otherwise may violate
 YouTube's Terms of Service or copyright law.
+
+### Hosting the helper so it works from any device
+
+The live site is static, so the From link tab only works if it can reach a
+helper. To make it work from your phone and other computers, host the helper
+and point the site at it:
+
+1. Deploy the [`Dockerfile`](Dockerfile) to any container host (Render, Fly.io,
+   Railway, a VPS). It runs `server/index.mjs` in public mode with `yt-dlp` and
+   `ffmpeg` installed. Set these environment variables on the host:
+
+   | Variable | Meaning |
+   | --- | --- |
+   | `ALLOWED_ORIGINS` | Your site, e.g. `https://rnvvts.github.io` (no path). Required. |
+   | `ACCESS_TOKEN` | Optional access code. Strongly recommended: without it anyone who finds the URL can use your server. |
+   | `MAX_CONCURRENT` | Simultaneous downloads (default 2). |
+   | `RATE_PER_HOUR` | Requests per IP per hour (default 30). |
+   | `MAX_SECONDS` | Longest video accepted (default 3600). |
+   | `YTDLP_COOKIES_FILE` | Optional cookies file, if YouTube blocks the server. |
+
+2. In the GitHub repo go to **Settings > Secrets and variables > Actions >
+   Variables** and add `HELPER_URL` set to the server's address (e.g.
+   `https://grain-helper.onrender.com`). Re-run the deploy workflow.
+
+Caveats: YouTube often blocks datacenter IP addresses ("confirm you're not a
+bot"), so a hosted helper can fail where a local one works. Keep `yt-dlp`
+current by rebuilding the image regularly. The link you paste, and the
+download, pass through your server.

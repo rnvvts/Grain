@@ -40,6 +40,9 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          # Address of the hosted download helper (repo variable); empty = tab shows local setup.
+          VITE_HELPER_URL: ${{ vars.HELPER_URL }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

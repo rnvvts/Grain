@@ -20,9 +20,30 @@ interface VideoInfo {
   duration: number
   thumbnail: string
   heights: number[]
+  tooLong?: boolean
+  maxSeconds?: number
 }
 
-type Helper = 'checking' | 'offline' | { ytdlp: boolean; ffmpeg: boolean }
+interface Health {
+  ytdlp: boolean
+  ffmpeg: boolean
+  tokenRequired?: boolean
+  maxSeconds?: number
+}
+
+type Helper = 'checking' | 'offline' | Health
+
+/** Hosted helper address, baked in at build time. Empty = same-origin /api (local dev). */
+const API = String(import.meta.env.VITE_HELPER_URL ?? '').replace(/\/$/, '')
+const TOKEN_KEY = 'grain-helper-token'
+
+function loadToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
 
 const FIELD =
   'w-full rounded-lg border border-hairline bg-canvas px-3 py-2 text-sm text-ink placeholder:text-ink-dim/60 hover:border-ink-dim/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent'
@@ -56,16 +77,28 @@ export function LinkDownloader() {
   const [height, setHeight] = useState(0)
   const [busy, setBusy] = useState<'info' | 'download' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [token, setToken] = useState(loadToken)
 
   const probe = useCallback(() => {
     setHelper('checking')
-    fetch('/api/health')
+    fetch(`${API}/api/health`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error('offline'))))
-      .then((h: { ytdlp: boolean; ffmpeg: boolean }) => setHelper(h))
+      .then((h: Health) => setHelper(h))
       .catch(() => setHelper('offline'))
   }, [])
 
   useEffect(probe, [probe])
+
+  const authHeaders = (): HeadersInit => (token ? { 'X-Grain-Token': token } : {})
+
+  const changeToken = (value: string) => {
+    setToken(value)
+    try {
+      localStorage.setItem(TOKEN_KEY, value)
+    } catch {
+      // Storage can be blocked; the code just won't be remembered.
+    }
+  }
 
   const pickKind = (next: Kind) => {
     setKind(next)
@@ -77,9 +110,14 @@ export function LinkDownloader() {
     setInfo(null)
     setBusy('info')
     try {
-      const res = await fetch(`/api/info?url=${encodeURIComponent(url.trim())}`)
+      const res = await fetch(`${API}/api/info?url=${encodeURIComponent(url.trim())}`, {
+        headers: authHeaders(),
+      })
       if (!res.ok) throw new Error(await errorOf(res))
       const data = (await res.json()) as VideoInfo
+      if (data.tooLong) {
+        throw new Error(`That video is longer than the ${Math.round((data.maxSeconds ?? 0) / 60)}-minute limit on this server.`)
+      }
       setInfo(data)
       setHeight(0)
     } catch (cause) {
@@ -97,7 +135,7 @@ export function LinkDownloader() {
       const q = kind === 'audio' ? quality : height
       const params = new URLSearchParams({ url: url.trim(), format, name: info.title })
       if (q > 0) params.set('quality', String(q))
-      const res = await fetch(`/api/download?${params}`)
+      const res = await fetch(`${API}/api/download?${params}`, { headers: authHeaders() })
       if (!res.ok) throw new Error(await errorOf(res))
       const blob = await res.blob()
       const link = document.createElement('a')
@@ -121,14 +159,25 @@ export function LinkDownloader() {
   if (helper === 'offline') {
     return (
       <div className="mt-6 rounded-xl border border-dashed border-hairline bg-surface/60 px-5 py-8 text-sm text-ink-dim">
-        <h2 className="text-base font-medium text-ink">The local helper isn't running</h2>
-        <p className="mt-2 max-w-xl leading-relaxed">
-          Downloading from a link needs <code>yt-dlp</code> and <code>ffmpeg</code>, which a web
-          page can't run. Install both, then start Grain with:
-        </p>
-        <pre className="mt-3 w-fit rounded-lg border border-hairline bg-canvas px-3 py-2 text-ink">
-          npm run dev:full
-        </pre>
+        {API ? (
+          <>
+            <h2 className="text-base font-medium text-ink">The download server isn't reachable</h2>
+            <p className="mt-2 max-w-xl leading-relaxed">
+              It may be waking up or temporarily down. Give it a minute and check again.
+            </p>
+          </>
+        ) : (
+          <>
+            <h2 className="text-base font-medium text-ink">The local helper isn't running</h2>
+            <p className="mt-2 max-w-xl leading-relaxed">
+              Downloading from a link needs <code>yt-dlp</code> and <code>ffmpeg</code>, which a
+              web page can't run. Install both, then start Grain with:
+            </p>
+            <pre className="mt-3 w-fit rounded-lg border border-hairline bg-canvas px-3 py-2 text-ink">
+              npm run dev:full
+            </pre>
+          </>
+        )}
         <button
           type="button"
           onClick={probe}
@@ -150,6 +199,18 @@ export function LinkDownloader() {
           The helper is running but {missing.join(' and ')} {missing.length > 1 ? 'were' : 'was'} not
           found on your PATH. Install {missing.length > 1 ? 'them' : 'it'} and restart.
         </p>
+      )}
+
+      {helper.tokenRequired && (
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => changeToken(e.target.value)}
+          placeholder="Access code"
+          aria-label="Access code"
+          autoComplete="off"
+          className={`${FIELD} sm:max-w-xs`}
+        />
       )}
 
       <form
@@ -282,7 +343,7 @@ export function LinkDownloader() {
       )}
 
       <p className="text-xs leading-relaxed text-ink-dim">
-        This runs through a helper on your own computer and does send the link to YouTube. Only
+        The link is sent to a helper that fetches it from YouTube for you. Only
         save videos you made or have permission to download — doing otherwise may break YouTube's
         Terms of Service or copyright law.
       </p>
