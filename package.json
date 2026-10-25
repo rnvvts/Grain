@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "helper": "node server/index.mjs",
+    "dev:full": "concurrently -k -n helper,vite \"npm:helper\" \"npm:dev\"",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
@@ -21,6 +23,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "concurrently": "^9.2.1",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",

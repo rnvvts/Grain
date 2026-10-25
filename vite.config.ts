@@ -8,6 +8,9 @@ export default defineConfig({
   // (user.github.io/ OR user.github.io/repo-name/) without reconfiguration.
   base: './',
   plugins: [react(), tailwindcss()],
+  // Local helper (server/index.mjs) for the "From link" tab; absent on the static deploy.
+  server: { proxy: { '/api': 'http://127.0.0.1:8787' } },
+  preview: { proxy: { '/api': 'http://127.0.0.1:8787' } },
   worker: {
     format: 'es',
   },

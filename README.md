@@ -142,3 +142,23 @@ one-time decoder download. Smaller batches keep it responsive.
 
 **Color is treated as sRGB.** Since ICC profiles are dropped, images in wider
 gamuts are converted as though they were sRGB, which can shift colors.
+
+## Downloading from a link (optional, local only)
+
+The **From link** tab saves a YouTube video's audio (MP3, M4A, WAV, Opus) or
+video (MP4, WebM, MKV) at a chosen bitrate or resolution. A static page cannot
+fetch YouTube's streams, so this runs through a small helper on your own
+machine (`server/index.mjs`) that wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+and [ffmpeg](https://ffmpeg.org/).
+
+1. Install `yt-dlp` and `ffmpeg` and make sure both are on your `PATH`.
+2. `npm run dev:full` starts the helper and the dev server together.
+
+The helper listens on `127.0.0.1` only, accepts only YouTube links, and rejects
+requests whose `Host` header is not a loopback name. The public GitHub Pages
+deploy has no helper, so the tab there just shows setup instructions.
+
+This is the one feature that is **not** private in the sense described above:
+the link you paste is sent to YouTube (by yt-dlp, from your machine). Only save
+videos you made or have permission to download; doing otherwise may violate
+YouTube's Terms of Service or copyright law.

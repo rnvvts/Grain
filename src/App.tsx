@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { Dropzone } from './components/Dropzone'
 import { FileCard } from './components/FileCard'
+import { LinkDownloader } from './components/LinkDownloader'
 import { OptionsPanel } from './components/OptionsPanel'
 import { Stat } from './components/Stat'
 import { useConverter, type Notice, type NoticeTone } from './state/useConverter'
@@ -85,6 +87,7 @@ function NoticeBlock({
 /* ---- page ----------------------------------------------------------- */
 
 export default function App() {
+  const [tab, setTab] = useState<'images' | 'link'>('images')
   const {
     jobs,
     options,
@@ -170,6 +173,33 @@ export default function App() {
           </p>
         </header>
 
+        <div role="tablist" className="mb-6 flex gap-1 border-b border-hairline">
+          {(
+            [
+              ['images', 'Images'],
+              ['link', 'From link'],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={tab === id}
+              onClick={() => setTab(id)}
+              className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors ${
+                tab === id
+                  ? 'border-accent text-ink'
+                  : 'border-transparent text-ink-dim hover:text-ink'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'link' && <LinkDownloader />}
+
+        <div hidden={tab !== 'images'}>
         {/* ---------------- dropzone ---------------- */}
         <Dropzone onFiles={addFiles} disabled={isConverting} />
 
@@ -367,6 +397,7 @@ export default function App() {
             )}
           </section>
         </main>
+        </div>
 
         {/* ---------------- footer ---------------- */}
         <footer className="mt-16 border-t border-hairline pt-6 text-xs leading-relaxed text-ink-dim">
